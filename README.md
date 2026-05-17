@@ -32,7 +32,7 @@ That said, the plugin has been code-audited, the OBS API usage has been verified
 - Background scene rendering — inactive scenes stay rendered and captured without being the active OBS scene
 - Per-slot resolution and FPS — each slot can output at a different resolution and frame rate
 - Per-slot video encoder selection — picks up all encoders available on your machine (NVENC, AMF, QSV, x264, etc.)
- - You can also use existing slots encoder to reduce encoder overhead.
+  - You can also use existing slots encoder to reduce encoder overhead.
 - Per-slot rate control — introspects the selected encoder's actual supported modes (CBR, CQP, CRF, VBR, etc.), not a hardcoded list
 - Per-slot audio encoder selection — choose per slot (AAC, Opus, etc.)
 - Per-slot audio track selection — select any combination of OBS's 6 audio mixer tracks per slot
