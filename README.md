@@ -9,8 +9,8 @@ An OBS Studio plugin that lets you record and clip from multiple scenes simultan
 ## Why this exists
 
 You ever been in that situation where you go "man, I wish I could record while streaming without having my overlays on the recording"? Well, source-record already handles that basically, and is a great plugin for it. Then someone with a very specific request appeared on Reddit and no matter what existing plugin combos I'd use, I couldn't achieve the desired result. So here we are; now you can record and clip separately any scene you want with any overlays/cameras/anything you have in there.  
-´´´ - "Slots" in this plugin are completely separate from you main stream/recording. 
-Shared encoder option does exist in this plugin, but you can only select the encoder of another existing "slot". So if you want to re-use existing encoder it's best to use only the plugin for recording to reduce encoder overhead. Using main obs recording output with this plugin will always result in one unnecessary encoder instance since that main output is fully separated from the plugin and can't be shared.´´´
+> - "Slots" in this plugin are completely separate from you main stream/recording. 
+Shared encoder option does exist in this plugin, but you can only select the encoder of another existing "slot". So if you want to re-use existing encoder it's best to use only the plugin for recording to reduce encoder overhead. Using main obs recording output with this plugin will always result in one unnecessary encoder instance since that main output is fully separated from the plugin and can't be shared. 
 
 ---
 
@@ -81,6 +81,6 @@ See [BUILD.md](BUILD.md) for full instructions.
 - Slots share OBS's global audio mix — audio routing is configured via OBS's Advanced Audio Properties as usual
 - MP4 replay buffers are not recoverable if OBS crashes before the clip is saved. MKV doesn't have this problem — prefer MKV if you're using replay-buffer-only mode
 - Each active slot costs additional encode overhead — plan your encoder choices accordingly. This is also why shared encoder exists.
-- example with 3 slots:  
- - Without shared encoder: 3 encode passes per frame
- - With shared encoder (slots 2+3 depend on slot 1): 1 encode pass per frame, 3 file writers
+  - example with 3 slots:  
+  - Without shared encoder: 3 encode passes per frame
+  - With shared encoder (slots 2+3 depend on slot 1): 1 encode pass per frame, 3 file writers
