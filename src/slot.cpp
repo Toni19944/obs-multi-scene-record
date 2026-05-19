@@ -266,6 +266,16 @@ bool SharedEncoder::build(const SceneSlot::Config &cfg)
 	view_ = obs_view_create();
 	obs_view_set_source(view_, 0, scene_src_);
 
+	// Per-slot video info. Per-slot scene independence (the plugin's identity)
+	// requires this dedicated video pipeline — see specs/003-perf-parity-audit
+	// research D1. The cost is one extra compositing pass per group; that is
+	// accepted as irreducible. We DO match every non-resolution / non-fps field
+	// to the user's OBS main video info (output_format, scale_type,
+	// gpu_conversion, colorspace, range) so we never impose an avoidable extra
+	// conversion on top of that irreducible cost.
+	struct obs_video_info main_ovi = {};
+	obs_get_video_info(&main_ovi);
+
 	struct obs_video_info ovi = {};
 	ovi.fps_num = cfg.fps_num;
 	ovi.fps_den = cfg.fps_den;
@@ -273,13 +283,11 @@ bool SharedEncoder::build(const SceneSlot::Config &cfg)
 	ovi.base_height = cfg.height;
 	ovi.output_width = cfg.width;
 	ovi.output_height = cfg.height;
-	ovi.output_format = VIDEO_FORMAT_NV12;
-	struct obs_video_info main_ovi = {};
-	obs_get_video_info(&main_ovi);
+	ovi.output_format = main_ovi.output_format;
 	ovi.colorspace = main_ovi.colorspace;
 	ovi.range = main_ovi.range;
-	ovi.gpu_conversion = true;
-	ovi.scale_type = OBS_SCALE_BICUBIC;
+	ovi.gpu_conversion = main_ovi.gpu_conversion;
+	ovi.scale_type = main_ovi.scale_type;
 
 	video_ = obs_view_add2(view_, &ovi);
 	if (!video_) {
