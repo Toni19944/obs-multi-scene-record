@@ -56,6 +56,17 @@ SceneSlot* SlotManager::slot_at(size_t i) const
     return i < slots_.size() ? slots_[i].get() : nullptr;
 }
 
+bool SlotManager::any_running() const
+{
+    // SceneSlot::is_running() is a lock-free atomic load on running_, so the
+    // scan never nests under slot_mtx_. Returns false for an empty slots_.
+    std::lock_guard<std::mutex> lk(mtx_);
+    for (auto& s : slots_) {
+        if (s->is_running()) return true;
+    }
+    return false;
+}
+
 void SlotManager::add_slot(const SceneSlot::Config& cfg)
 {
     SceneSlot* added = nullptr;

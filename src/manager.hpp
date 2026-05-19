@@ -97,6 +97,12 @@ public:
     void register_all_hotkeys();
     void unregister_all_hotkeys();
 
+    // Lock-and-scan probe: returns true if at least one slot is currently
+    // running. Takes mtx_ briefly; the per-slot is_running() check is a
+    // lock-free atomic load, so no nested locking under slot_mtx_ occurs.
+    // Used by the dock to gate its 1 Hz stats QTimer (see ui-dock.cpp).
+    bool any_running() const;
+
     // Persistence (via obs_frontend save callback)
     void save_to(obs_data_t* save_data);
     void load_from(obs_data_t* save_data);

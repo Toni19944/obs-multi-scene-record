@@ -39,8 +39,7 @@ static QString fmt_bytes_rate(double kbps)
 {
     if (kbps <= 0.0) return "--";
     if (kbps >= 1000.0) return QString::number(kbps / 1000.0, 'f', 2) + " Mbps";
-    if (kbps >= 100.0)  return QString::number(kbps, 'f', 0) + " kbps";
-    return QString::number(kbps, 'f', 1) + " kbps";
+    return QString::number(kbps, 'f', 0) + " kbps";
 }
 
 // ITEM C: COL_STATE cell-widget styling. Keeps the original visual semantics
@@ -115,6 +114,7 @@ MultiSceneRecordDock::MultiSceneRecordDock(QWidget* parent) : QWidget(parent)
     stats_chk_->setChecked(stats_enabled_);
     stats_chk_->blockSignals(false);
     apply_stats_visibility();
+    if (stats_enabled_) stats_timer_->start();
 
     refresh();
 }
@@ -140,22 +140,14 @@ MultiSceneRecordDock::~MultiSceneRecordDock()
 void MultiSceneRecordDock::refresh()
 {
     auto& mgr = SlotManager::instance();
-    auto snap = mgr.snapshot_slots();
-    last_generation_ = snap.generation;
-    const int n = (int)snap.items.size();
+    // Sync the generation so the refresh_stats() that runs at the end of
+    // this function (and the next polled one) does not re-trigger a rebuild.
+    last_generation_ = mgr.generation();
+    const int n = (int)mgr.slot_count();
 
     table_->setRowCount(n);
-
-    auto set_text = [this](int row, int col, const QString& text) {
-        if (auto* it = table_->item(row, col)) {
-            it->setText(text);
-        } else {
-            table_->setItem(row, col, mk_item(text));
-        }
-    };
-
     for (int i = 0; i < n; ++i) {
-        SceneSlot* s = snap.items[i].get();
+        SceneSlot* s = mgr.slot_at((size_t)i);
         if (!s) continue;
         const auto& c = s->config();
 
@@ -183,26 +175,26 @@ void MultiSceneRecordDock::refresh()
                 table_->setCellWidget(i, COL_STATE, sb);
             }
         }
-        set_text(i, COL_NAME,  QString::fromStdString(c.name));
-        set_text(i, COL_SCENE, QString::fromStdString(c.scene_name));
-        set_text(i, COL_RES,
-            QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num));
+        table_->setItem(i, COL_NAME,   mk_item(QString::fromStdString(c.name)));
+        table_->setItem(i, COL_SCENE,  mk_item(QString::fromStdString(c.scene_name)));
+        table_->setItem(i, COL_RES,
+            mk_item(QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num)));
         if (!c.shared_encoder_slot_id.empty()) {
-            std::string primary_name = mgr.slot_name_by_id(c.shared_encoder_slot_id);
+            std::string primary_name = SlotManager::instance().slot_name_by_id(c.shared_encoder_slot_id);
             QString display = primary_name.empty()
                 ? QString::fromUtf8("\xe2\x86\x92 [deleted]")
                 : QString::fromUtf8("\xe2\x86\x92 ") + QString::fromStdString(primary_name);
-            set_text(i, COL_ENC, display);
+            table_->setItem(i, COL_ENC, mk_item(display));
         } else {
-            set_text(i, COL_ENC, QString::fromStdString(c.video_encoder_id));
+            table_->setItem(i, COL_ENC, mk_item(QString::fromStdString(c.video_encoder_id)));
         }
-        set_text(i, COL_FRAMES,  "--");
-        set_text(i, COL_DROPPED, "--");
-        set_text(i, COL_KBPS,    "--");
-        set_text(i, COL_REPLAY,
-            c.replay_enabled
-                ? QString("%1s").arg(c.replay_seconds)
-                : QString("--"));
+        table_->setItem(i, COL_FRAMES, mk_item("--"));
+        table_->setItem(i, COL_DROPPED, mk_item("--"));
+        table_->setItem(i, COL_KBPS,   mk_item("--"));
+        table_->setItem(i, COL_REPLAY,
+            mk_item(c.replay_enabled
+                    ? QString("%1s").arg(c.replay_seconds)
+                    : QString("--")));
     }
 
     // F1: gate the 1 Hz stats QTimer on real activity. refresh() runs after
@@ -224,16 +216,18 @@ void MultiSceneRecordDock::refresh_stats()
     if (!stats_enabled_) return;
     auto& mgr = SlotManager::instance();
 
-    auto snap = mgr.snapshot_slots();
-    if (snap.generation != last_generation_) { refresh(); return; }
+    // If slots_ was rebuilt (e.g. scene-collection load on another thread),
+    // any cached SceneSlot* is stale. Rebuild the whole table instead of
+    // poking per-row stats. refresh() resyncs last_generation_.
+    const size_t gen = mgr.generation();
+    if (gen != last_generation_) { refresh(); return; }
 
-    const int n = (int)snap.items.size();
+    const int n = (int)mgr.slot_count();
     if (table_->rowCount() != n) { refresh(); return; }
 
     for (int i = 0; i < n; ++i) {
-        SceneSlot* s = snap.items[i].get();
+        SceneSlot* s = mgr.slot_at((size_t)i);
         if (!s) continue;
-        const auto& c = s->config();
         SceneSlot::Stats st = s->stats();
 
         // ITEM C: COL_STATE is now a cell widget, not a QTableWidgetItem.
@@ -242,11 +236,14 @@ void MultiSceneRecordDock::refresh_stats()
         if (auto* sb = qobject_cast<QPushButton*>(
                 table_->cellWidget(i, COL_STATE))) {
             const bool running = s->is_running();
-            sb->setText(state_btn_text(running, c.replay_only));
+            sb->setText(state_btn_text(running, s->config().replay_only));
             sb->setStyleSheet(state_btn_style(running));
         }
 
+        // Encoder column: warn when the configured encoder was unavailable
+        // and we silently fell back to obs_x264/CBR.
         if (auto* enc = table_->item(i, COL_ENC)) {
+            const auto& c = s->config();
             QString base;
             if (!c.shared_encoder_slot_id.empty()) {
                 std::string pn = mgr.slot_name_by_id(c.shared_encoder_slot_id);
@@ -275,7 +272,9 @@ void MultiSceneRecordDock::refresh_stats()
         if (auto* it = table_->item(i, COL_KBPS))
             it->setText(s->is_running() ? fmt_bytes_rate(st.kbps) : "--");
 
+        // Replay column: show "armed" if replay output is actively buffering.
         if (auto* it = table_->item(i, COL_REPLAY)) {
+            const auto& c = s->config();
             if (!c.replay_enabled) it->setText("--");
             else if (st.replay_active) it->setText(QString("armed %1s").arg(c.replay_seconds));
             else it->setText(QString("off %1s").arg(c.replay_seconds));
@@ -391,7 +390,7 @@ void MultiSceneRecordDock::on_stats_toggled(bool on)
         for (size_t i = 0; i < mgr.slot_count(); ++i) {
             if (auto* s = mgr.slot_at(i)) s->reset_stats_sampler();
         }
-        if (mgr.any_running()) stats_timer_->start();
+        stats_timer_->start();
         // First tick immediately so the user sees fresh values without a 1s wait.
         // (We still need the second tick before bitrate is non-zero since it's
         // a delta; this just populates frames/dropped without delay.)
