@@ -5,7 +5,6 @@
 #include <map>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <mutex>
 
@@ -52,31 +51,12 @@ struct SharedEncoder {
     bool build(const SceneSlot::Config& owner_cfg);
 };
 
-// Result of SlotManager::effective_rate_control — the single source of truth
-// for the rate-control mode/value as they appear at the encoder. Owner slots
-// return their own Config values; consumer slots return the owner's, with the
-// fallback overlay when the owner's encoder was built under the obs_x264/CBR
-// safety net.
-struct EffectiveRC {
-    std::string mode;             // e.g. "CBR", "CQP", "Lossless"
-    uint32_t    value = 0;        // bitrate kbps or quality level
-                                  // (undefined when rc_util::is_lossless(mode))
-    bool        fallback = false; // owner's encoder construction fell back to obs_x264/CBR
-    std::string owner_slot_name;  // empty when c is its own owner
-};
-
 class SlotManager {
 public:
     static SlotManager& instance();
 
     void init();
     void shutdown();
-
-    struct SlotSnapshot {
-        std::vector<std::shared_ptr<SceneSlot>> items;
-        size_t generation;
-    };
-    SlotSnapshot snapshot_slots() const;
 
     // CRUD
     size_t slot_count() const;
@@ -98,19 +78,6 @@ public:
     bool config_by_slot_id(const std::string& slot_id,
                            SceneSlot::Config& out) const;
 
-    // Single source of truth for the rate-control mode/value as they appear
-    // at the encoder. For an owner slot returns its own fields; for a
-    // consumer slot resolves to the owner's Config (via config_by_slot_id
-    // under mtx_, briefly) and overlays the SharedEncoder::encoder_fallback_
-    // flag (briefly under shared_mtx_) when the owner's encoder was built
-    // under fallback. Threading: takes mtx_ then releases; takes shared_mtx_
-    // then releases; NEVER holds both at once. Caller MUST NOT hold mtx_ or
-    // shared_mtx_. Caller MAY hold slot_mtx_ — the helper only takes leaf
-    // shared_mtx_ and the manager's own mtx_ which is above slot_mtx_, BUT
-    // when slot_mtx_ is already held callers MUST NOT call this (would
-    // invert mtx_ -> slot_mtx_); resolve before taking slot_mtx_ instead.
-    EffectiveRC effective_rate_control(const SceneSlot::Config& c) const;
-
     // Shared-encoder registry. Both operate under shared_mtx_ ONLY (strict
     // leaf lock — see LOCKING in manager.cpp). They must never take mtx_ or
     // slot_mtx_, hence acquire takes the owner Config by value (resolved by
@@ -130,12 +97,6 @@ public:
     void register_all_hotkeys();
     void unregister_all_hotkeys();
 
-    // Lock-and-scan probe: returns true if at least one slot is currently
-    // running. Takes mtx_ briefly; the per-slot is_running() check is a
-    // lock-free atomic load, so no nested locking under slot_mtx_ occurs.
-    // Used by the dock to gate its 1 Hz stats QTimer (see ui-dock.cpp).
-    bool any_running() const;
-
     // Persistence (via obs_frontend save callback)
     void save_to(obs_data_t* save_data);
     void load_from(obs_data_t* save_data);
@@ -154,13 +115,10 @@ private:
     static void save_cb(obs_data_t* save_data, bool saving, void* ptr);
 
     mutable std::mutex mtx_;
-    std::vector<std::shared_ptr<SceneSlot>> slots_;
+    std::vector<std::unique_ptr<SceneSlot>> slots_;
     bool started_ = false;
     // Bumped under mtx_ each time slots_ is rebuilt by load_from().
     size_t generation_ = 0;
-    std::unordered_map<std::string, size_t> id_index_;
-
-    void rebuild_id_index();
 
     // Shared-encoder registry, keyed by encoder-group key (the group-key
     // slot's id). Guarded by its OWN dedicated leaf mutex so acquire/release
