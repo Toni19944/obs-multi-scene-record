@@ -151,23 +151,29 @@ void MultiSceneRecordDock::refresh()
         if (!s) continue;
         const auto& c = s->config();
 
-        // ITEM C: COL_STATE is a clickable per-row start/stop toggle. Use a
-        // flat button cell widget (recreated on each discrete refresh; the
-        // 1 s stats poll mutates it in place via refresh_stats(), it does not
-        // rebuild). A cell widget also naturally resolves the single/double-
-        // click conflict: the button consumes its own clicks so a double-
-        // click here does NOT reach QTableWidget::cellDoubleClicked, leaving
-        // double-click-to-edit intact for every OTHER column.
+        // ITEM C: COL_STATE is a clickable per-row start/stop toggle. Reuse
+        // the existing cell widget when present (F2): only allocate a new
+        // QPushButton when the row was just added. The lambda captures `i`
+        // by value and remains valid across refreshes because setRowCount()
+        // truncates extra rows rather than shifting — rows above a deletion
+        // never move, rows below are dropped, so a row's index never changes
+        // for the lifetime of its button.
         {
             const bool running = s->is_running();
-            auto* sb = new QPushButton(
-                state_btn_text(running, c.replay_only));
-            sb->setFlat(true);
-            sb->setCursor(Qt::PointingHandCursor);
-            sb->setStyleSheet(state_btn_style(running));
-            connect(sb, &QPushButton::clicked, this,
-                    [this, i]() { on_state_clicked(i); });
-            table_->setCellWidget(i, COL_STATE, sb);
+            auto* sb = qobject_cast<QPushButton*>(
+                table_->cellWidget(i, COL_STATE));
+            if (sb) {
+                sb->setText(state_btn_text(running, c.replay_only));
+                sb->setStyleSheet(state_btn_style(running));
+            } else {
+                sb = new QPushButton(state_btn_text(running, c.replay_only));
+                sb->setFlat(true);
+                sb->setCursor(Qt::PointingHandCursor);
+                sb->setStyleSheet(state_btn_style(running));
+                connect(sb, &QPushButton::clicked, this,
+                        [this, i]() { on_state_clicked(i); });
+                table_->setCellWidget(i, COL_STATE, sb);
+            }
         }
         table_->setItem(i, COL_NAME,   mk_item(QString::fromStdString(c.name)));
         table_->setItem(i, COL_SCENE,  mk_item(QString::fromStdString(c.scene_name)));
@@ -190,6 +196,18 @@ void MultiSceneRecordDock::refresh()
                     ? QString("%1s").arg(c.replay_seconds)
                     : QString("--")));
     }
+
+    // F1: gate the 1 Hz stats QTimer on real activity. refresh() runs after
+    // every state transition (add/remove/edit/start/stop, hotkey toggle,
+    // external stop via slot.cpp's queued invokeMethod), so the timer stays
+    // in sync without per-event bookkeeping. When stats are disabled or no
+    // slot is running, the timer is paused so stopped slots cost nothing.
+    if (stats_enabled_ && mgr.any_running()) {
+        if (!stats_timer_->isActive()) stats_timer_->start();
+    } else {
+        if (stats_timer_->isActive()) stats_timer_->stop();
+    }
+
     refresh_stats();
 }
 
