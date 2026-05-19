@@ -7,12 +7,21 @@
 #include <string>
 #include <vector>
 
-// One independent recording + optional replay buffer attached to a single scene.
+// One independent recording + optional replay buffer.
 //
-// Video: per-slot obs_view_t at slot resolution/FPS, fully independent.
+// Video: the scene/view/video/encoder pipeline lives in a refcounted
+//        SharedEncoder context owned by SlotManager and keyed by an
+//        encoder-group key (this slot's own id when it owns the encoder, or
+//        the referenced slot's id when it shares one). A slot is just a
+//        consumer of that context: it acquires it in start() and releases it
+//        in teardown. The context (and its scene/view/video/encoder) is built
+//        on the first consumer's acquire and destroyed by the LAST consumer's
+//        release, so stopping one slot never disturbs others in the group and
+//        the encoder's owner need not be running.
 // Audio: shares OBS's main audio mix. Each enabled track gets its own audio
 //        encoder bound at the corresponding mixer index; all encoders attach
 //        to the output at consecutive positions -> multi-track output file.
+//        Audio encoders remain strictly per-slot.
 // Rate control: the mode string and its value are stored generically. The
 //        editor discovers valid modes by introspecting the encoder's
 //        properties, so this struct doesn't hardcode any encoder specifics.
@@ -172,23 +181,40 @@ public:
     SceneSlot(const SceneSlot&) = delete;
     SceneSlot& operator=(const SceneSlot&) = delete;
 
-    bool start(obs_encoder_t* borrowed_venc = nullptr);
+    bool start();
     void stop();
     bool is_running() const { return running_.load(); }
 
     bool save_replay();
 
     const Config& config() const { return cfg_; }
-    void update_config(const Config& c, obs_encoder_t* resolved_venc = nullptr);
-
-    // Returns the live video encoder under slot_mtx_ (copy of the pointer).
-    obs_encoder_t* video_encoder() const;
+    void update_config(const Config& c);
 
     // Hotkey lifecycle is owned by the caller (SlotManager), not by start/stop,
     // so the "toggle recording" hotkey works even while the slot is stopped.
     // Both calls are idempotent.
     void register_hotkeys();
     void unregister_hotkeys();
+
+    // --- per-slot hotkey-binding persistence (ITEM A) ---------------------
+    // obs_hotkey_register_*() only creates the live hotkey; the user's key
+    // combination lives nowhere unless we explicitly save/restore it. These
+    // make a register/unregister cycle (and a destroy+recreate across
+    // save/load) preserve the binding.
+    //
+    // capture_hotkey_bindings(): snapshot the two LIVE hotkeys into the
+    //   pending_* members. Used around an in-session unregister+register
+    //   cycle (update_config); register_hotkeys() then re-applies them.
+    // save_hotkey_bindings(d): write the two bindings into `d` under stable
+    //   keys for durable (cross-restart / cross-reload) persistence. Uses the
+    //   live hotkeys when registered, else any not-yet-applied pending_*.
+    // set_pending_hotkey_bindings(rec,rep): take ownership of binding arrays
+    //   read back from saved data so register_hotkeys() can apply them once
+    //   the hotkeys are (re)created. nullptr => nothing to restore.
+    void capture_hotkey_bindings();
+    void save_hotkey_bindings(obs_data_t* d) const;
+    void set_pending_hotkey_bindings(obs_data_array_t* rec,
+                                     obs_data_array_t* rep);
 
     static void on_record_hotkey(void* data, obs_hotkey_id id,
                                  obs_hotkey_t* hotkey, bool pressed);
@@ -201,7 +227,6 @@ public:
     static void on_replay_output_stop(void* data, calldata_t* cd);
 
 private:
-    bool setup_video();
     bool setup_encoders();
     bool setup_outputs();
     // Public locking entry point: acquires slot_mtx_ then calls teardown_locked().
@@ -214,28 +239,33 @@ private:
     // up to a 5 s timeout; force-stops as a last resort.
     void wait_for_output_stop(obs_output_t* out);
 
-    // Guards every mutable SceneSlot member below (outputs, encoders, view,
-    // scene source, cfg_). Acquired by start()/teardown()/stats()/
-    // save_replay()/update_config()/video_encoder(). Lock order:
-    // SlotManager::mtx_ -> SceneSlot::slot_mtx_ -> SceneSlot::stats_mtx_.
+    // Guards every mutable SceneSlot member below (outputs, audio encoders,
+    // the borrowed shared-encoder pointer, group_key_, cfg_). Acquired by
+    // start()/teardown()/stats()/save_replay()/update_config(). Lock order:
+    // SlotManager::mtx_ -> SceneSlot::slot_mtx_ -> SceneSlot::stats_mtx_,
+    // and (in start()/teardown_locked()) the strict leaf
+    // SlotManager::shared_mtx_ is taken last of all.
     mutable std::mutex slot_mtx_;
 
     Config cfg_;
     std::atomic<bool> running_{false};
 
-    // True when the configured encoder was unavailable and we fell back to
-    // obs_x264/CBR. Surfaced to the UI so the user knows their rate-control
-    // configuration was not applied. Guarded by slot_mtx_.
+    // Local copy of the shared context's fallback flag, taken at start() so
+    // stats() can surface "[CBR fallback]" for the owner AND every sharer
+    // without touching the shared registry. Guarded by slot_mtx_.
     bool encoder_fallback_ = false;
 
-    obs_source_t* scene_src_    = nullptr;
-    std::atomic<bool> showing_held_{false};
+    // Encoder-group key of the SharedEncoder this slot is currently
+    // consuming (own id for an owner, referenced slot's id for a sharer).
+    // Set in start(), used by teardown_locked() to release the right
+    // context, cleared on teardown. Guarded by slot_mtx_.
+    std::string group_key_;
 
-    obs_view_t* view_  = nullptr;
-    video_t*    video_ = nullptr;
-
+    // Borrowed pointer to the shared context's encoder (a strong ref is held
+    // on our behalf by SlotManager::acquire_shared_encoder; released via
+    // release_shared_encoder). Used to attach to this slot's outputs. Non-null
+    // only while this slot is an active consumer. Guarded by slot_mtx_.
     obs_encoder_t* venc_ = nullptr;
-    bool owns_venc_ = true;
     std::vector<obs_encoder_t*> aencs_;   // one encoder per selected track
     // 0-based OBS track index for each entry in aencs_, in push order. Used
     // to attach each encoder at the matching output audio index.
@@ -246,6 +276,25 @@ private:
 
     obs_hotkey_id hotkey_record_ = OBS_INVALID_HOTKEY_ID;
     obs_hotkey_id hotkey_replay_ = OBS_INVALID_HOTKEY_ID;
+
+    // Inert per-slot output that exists solely so OBS Settings > Hotkeys
+    // groups the two hotkeys above under its name ("Multi-Scene Record: <slot
+    // name>"). Created in register_hotkeys() via obs_output_create with type
+    // "ffmpeg_muxer" and never started; released in unregister_hotkeys() after
+    // both hotkey ids have been unregistered (the registered hotkeys hold a
+    // weak ref to it). Destroy+recreate is the only way to refresh the label
+    // on rename, since libobs has no obs_output_set_name.
+    obs_output_t* hotkey_out_ = nullptr;
+
+    // Owned key-binding arrays awaiting (re)application by register_hotkeys()
+    // immediately after the matching obs_hotkey_register_* call. Populated
+    // either by capture_hotkey_bindings() (in-session cycle) or by
+    // set_pending_hotkey_bindings() (restored from saved data during a
+    // load_from rebuild). null when nothing is pending. register_hotkeys()
+    // obs_hotkey_load()s then release+nulls each; ~SceneSlot releases any
+    // still-pending array so an unconsumed restore cannot leak.
+    obs_data_array_t* pending_hk_record_ = nullptr;
+    obs_data_array_t* pending_hk_replay_ = nullptr;
 
     std::mutex stats_mtx_;
     uint64_t   last_sample_bytes_ns_ = 0;

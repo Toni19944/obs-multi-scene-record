@@ -42,6 +42,21 @@ static QString fmt_bytes_rate(double kbps)
     return QString::number(kbps, 'f', 0) + " kbps";
 }
 
+// ITEM C: COL_STATE cell-widget styling. Keeps the original visual semantics
+// (running = red 220,80,80; stopped = gray 140,140,140) on a flat,
+// label-looking button so the only change is that the cell is now clickable.
+static QString state_btn_style(bool running)
+{
+    const char* col = running ? "rgb(220,80,80)" : "rgb(140,140,140)";
+    return QString("QPushButton{border:none;background:transparent;"
+                   "font-weight:bold;color:%1;}").arg(col);
+}
+
+static QString state_btn_text(bool running, bool replay_only)
+{
+    return running ? (replay_only ? "RPL" : "REC") : "off";
+}
+
 MultiSceneRecordDock::MultiSceneRecordDock(QWidget* parent) : QWidget(parent)
 {
     table_ = new QTableWidget(0, COL_COUNT, this);
@@ -136,8 +151,24 @@ void MultiSceneRecordDock::refresh()
         if (!s) continue;
         const auto& c = s->config();
 
-        table_->setItem(i, COL_STATE,
-            mk_item(s->is_running() ? (c.replay_only ? "RPL" : "REC") : "off"));
+        // ITEM C: COL_STATE is a clickable per-row start/stop toggle. Use a
+        // flat button cell widget (recreated on each discrete refresh; the
+        // 1 s stats poll mutates it in place via refresh_stats(), it does not
+        // rebuild). A cell widget also naturally resolves the single/double-
+        // click conflict: the button consumes its own clicks so a double-
+        // click here does NOT reach QTableWidget::cellDoubleClicked, leaving
+        // double-click-to-edit intact for every OTHER column.
+        {
+            const bool running = s->is_running();
+            auto* sb = new QPushButton(
+                state_btn_text(running, c.replay_only));
+            sb->setFlat(true);
+            sb->setCursor(Qt::PointingHandCursor);
+            sb->setStyleSheet(state_btn_style(running));
+            connect(sb, &QPushButton::clicked, this,
+                    [this, i]() { on_state_clicked(i); });
+            table_->setCellWidget(i, COL_STATE, sb);
+        }
         table_->setItem(i, COL_NAME,   mk_item(QString::fromStdString(c.name)));
         table_->setItem(i, COL_SCENE,  mk_item(QString::fromStdString(c.scene_name)));
         table_->setItem(i, COL_RES,
@@ -181,15 +212,14 @@ void MultiSceneRecordDock::refresh_stats()
         if (!s) continue;
         SceneSlot::Stats st = s->stats();
 
-        QTableWidgetItem* state = table_->item(i, COL_STATE);
-        if (state) {
+        // ITEM C: COL_STATE is now a cell widget, not a QTableWidgetItem.
+        // Mutate the existing button in place (no rebuild) so the polled
+        // stats tick keeps the toggle's label/color in sync with true state.
+        if (auto* sb = qobject_cast<QPushButton*>(
+                table_->cellWidget(i, COL_STATE))) {
             const bool running = s->is_running();
-            state->setText(running
-                           ? (s->config().replay_only ? "RPL" : "REC")
-                           : "off");
-            state->setForeground(QBrush(running
-                                       ? QColor(220, 80, 80)
-                                       : QColor(140, 140, 140)));
+            sb->setText(state_btn_text(running, s->config().replay_only));
+            sb->setStyleSheet(state_btn_style(running));
         }
 
         // Encoder column: warn when the configured encoder was unavailable
@@ -304,6 +334,31 @@ void MultiSceneRecordDock::on_save_replay()
 }
 
 void MultiSceneRecordDock::on_cell_double_clicked(int /*row*/, int /*col*/) { on_edit(); }
+
+void MultiSceneRecordDock::on_state_clicked(int row)
+{
+    auto& mgr = SlotManager::instance();
+    SceneSlot* s = mgr.slot_at((size_t)row);
+    if (!s) return;
+
+    // A cell-widget click does not move the table selection by itself; make
+    // this row current so Edit / Remove / Save replay (current_row()) still
+    // have a usable target. COL_NAME is a plain item cell (not the button),
+    // and with SelectRows this selects the whole row.
+    table_->setCurrentCell(row, COL_NAME);
+
+    // Mirror on_record_hotkey's discipline: slot_at() already took and
+    // released SlotManager::mtx_, so call start()/stop() with NO manager lock
+    // held. Synchronous, exactly like Start all / Stop all; no cascade.
+    if (s->is_running()) s->stop();
+    else                 s->start();
+
+    // Reflect the slot's ACTUAL post-toggle state: start() returns false and
+    // resets running_ on an empty/missing output path, so a failed start
+    // leaves the row showing "off" rather than a fake running state. Reuse
+    // the existing refresh() path (same as Start all / Stop all).
+    refresh();
+}
 
 void MultiSceneRecordDock::on_stats_toggled(bool on)
 {

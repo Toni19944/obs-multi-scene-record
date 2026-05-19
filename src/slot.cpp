@@ -245,6 +245,127 @@ static void apply_encoder_settings(obs_data_t* s, const std::string& enc_id,
 }
 
 // =============================================================================
+// shared encoder context (scene/view/video/encoder pipeline)
+// =============================================================================
+//
+// Relocated here (not duplicated): the former SceneSlot::setup_video() and the
+// owner branch of SceneSlot::setup_encoders() now live in SharedEncoder::build,
+// parameterized by the group-key slot's Config rather than the consuming
+// slot's. fetch_scene_source / apply_encoder_settings / apply_family_presets /
+// rc_util are reused from above.
+
+bool SharedEncoder::build(const SceneSlot::Config& cfg)
+{
+    // (1) scene source + "showing" reference.
+    scene_src_ = fetch_scene_source(cfg.scene_name);
+    if (!scene_src_) {
+        blog(LOG_WARNING,
+             "[multi-scene-rec] shared encoder: scene '%s' not found",
+             cfg.scene_name.c_str());
+        return false;
+    }
+    obs_source_inc_showing(scene_src_);
+
+    // (2) per-group view + video at the owner's resolution/fps.
+    view_ = obs_view_create();
+    obs_view_set_source(view_, 0, scene_src_);
+
+    struct obs_video_info ovi = {};
+    ovi.fps_num        = cfg.fps_num;
+    ovi.fps_den        = cfg.fps_den;
+    ovi.base_width     = cfg.width;
+    ovi.base_height    = cfg.height;
+    ovi.output_width   = cfg.width;
+    ovi.output_height  = cfg.height;
+    ovi.output_format  = VIDEO_FORMAT_NV12;
+    struct obs_video_info main_ovi = {};
+    obs_get_video_info(&main_ovi);
+    ovi.colorspace     = main_ovi.colorspace;
+    ovi.range          = main_ovi.range;
+    ovi.gpu_conversion = true;
+    ovi.scale_type     = OBS_SCALE_BICUBIC;
+
+    video_ = obs_view_add2(view_, &ovi);
+    if (!video_) {
+        blog(LOG_ERROR,
+             "[multi-scene-rec] shared encoder: obs_view_add2 failed for '%s'",
+             cfg.name.c_str());
+        return false; // dtor cleans view + scene
+    }
+
+    // (3) video encoder + x264/CBR fallback (identical path to the former
+    //     owner branch of setup_encoders()), then bind to this group's video_t.
+    const std::string enc_id =
+        cfg.video_encoder_id.empty() ? std::string("obs_x264")
+                                     : cfg.video_encoder_id;
+
+    obs_data_t* vs = obs_data_create();
+    apply_encoder_settings(vs, enc_id, cfg);
+    venc_ = obs_video_encoder_create(enc_id.c_str(),
+                                     ("venc_" + cfg.id).c_str(),
+                                     vs, nullptr);
+    obs_data_release(vs);
+
+    if (!venc_) {
+        // Fall back to x264 + CBR if the requested encoder is unavailable on
+        // this machine. The saved rate control mode may not exist on x264
+        // (e.g. CQP), so force CBR with a safe bitrate.
+        blog(LOG_WARNING,
+             "[multi-scene-rec] shared encoder '%s' unavailable, falling back to obs_x264/CBR",
+             enc_id.c_str());
+        obs_data_t* fs = obs_data_create();
+        apply_family_presets(fs, "obs_x264", cfg);
+        obs_data_set_string(fs, "rate_control", "CBR");
+        obs_data_set_int(fs, "bitrate",
+                         rc_util::is_bitrate_based(cfg.rate_control)
+                             ? cfg.rc_value : 6000);
+        venc_ = obs_video_encoder_create("obs_x264",
+                                         ("venc_" + cfg.id).c_str(),
+                                         fs, nullptr);
+        obs_data_release(fs);
+        if (!venc_) {
+            blog(LOG_ERROR,
+                 "[multi-scene-rec] shared video encoder create failed");
+            return false; // dtor cleans view + scene
+        }
+        // The user's rate-control configuration was discarded; surface this
+        // in the UI (see Stats::encoder_fallback) for owner and sharers.
+        encoder_fallback_ = true;
+    }
+    obs_encoder_set_video(venc_, video_);
+    return true;
+}
+
+SharedEncoder::~SharedEncoder()
+{
+    // Mandatory destroy order: encoder before view, view before scene. Also
+    // serves as partial-build cleanup (any subset of handles may be null).
+
+    // (1) Final encoder release, matching obs_video_encoder_create in build().
+    //     All consumer refs (obs_encoder_get_ref) were released by
+    //     release_shared_encoder before use_count reached 0; this drops the
+    //     creation ref and destroys the encoder.
+    if (venc_) {
+        obs_encoder_release(venc_);
+        venc_ = nullptr;
+    }
+    // (2) Detach and destroy the per-group view (clear its source first).
+    if (view_) {
+        obs_view_set_source(view_, 0, nullptr);
+        obs_view_remove(view_);
+        obs_view_destroy(view_);
+        view_ = nullptr;
+        video_ = nullptr;
+    }
+    // (3) Drop the scene "showing" reference, then release the scene source.
+    if (scene_src_) {
+        obs_source_dec_showing(scene_src_);
+        obs_source_release(scene_src_);
+        scene_src_ = nullptr;
+    }
+}
+
+// =============================================================================
 // ctor/dtor
 // =============================================================================
 
@@ -257,9 +378,13 @@ SceneSlot::~SceneSlot()
 {
     stop();
     unregister_hotkeys();
+    // Release any binding arrays that were stashed (load_from restore) but
+    // never consumed by register_hotkeys() before this slot was destroyed.
+    if (pending_hk_record_) obs_data_array_release(pending_hk_record_);
+    if (pending_hk_replay_) obs_data_array_release(pending_hk_replay_);
 }
 
-void SceneSlot::update_config(const Config& c, obs_encoder_t* resolved_venc)
+void SceneSlot::update_config(const Config& c)
 {
     bool was_running = running_.load();
     bool had_hotkeys = (hotkey_record_ != OBS_INVALID_HOTKEY_ID);
@@ -278,64 +403,84 @@ void SceneSlot::update_config(const Config& c, obs_encoder_t* resolved_venc)
             cfg_.id = keep_id.empty() ? generate_slot_id() : keep_id;
     }
 
-    // Re-register so hotkey descriptions track the (possibly new) name.
-    // Binding is keyed by the registration name string (which embeds the
-    // stable id), so unregister+register preserves the user's binding.
+    // The user's key combination is NOT preserved by a bare unregister+
+    // register: obs_hotkey_register_*() creates a fresh, unbound hotkey.
+    // Snapshot the two live bindings, cycle, then re-apply (register_hotkeys()
+    // consumes the pending_* arrays right after re-registering). This keeps an
+    // in-session rename/edit on the user's assigned keys.
     if (had_hotkeys) {
+        capture_hotkey_bindings();
         unregister_hotkeys();
         register_hotkeys();
     }
 
-    if (was_running) {
-        // A dependent slot cannot run without its primary's encoder. The
-        // caller (SlotManager::update_slot, holding mtx_) already resolved
-        // it; if null the primary is not running. Skip the restart instead
-        // of letting start() perform the locked lookup, which would
-        // re-enter SlotManager::mtx_ on the caller's thread (deadlock).
-        if (!cfg_.shared_encoder_slot_id.empty() && !resolved_venc) {
-            blog(LOG_ERROR,
-                 "[multi-scene-rec] '%s': primary slot '%s' not running, cannot restart dependent after edit",
-                 cfg_.name.c_str(), cfg_.shared_encoder_slot_id.c_str());
-        } else {
-            start(resolved_venc);
-        }
-    }
+    // The restart re-resolves the group key from the NEW cfg_ and re-acquires
+    // the shared context inside start(). A sharing slot whose owner is not
+    // running now restarts fine: start() builds the context from the owner's
+    // persisted Config (the owner is never required to run).
+    if (was_running) start();
 }
 
 // =============================================================================
 // start / stop
 // =============================================================================
 
-bool SceneSlot::start(obs_encoder_t* borrowed_venc)
+bool SceneSlot::start()
 {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return true;
 
-    // Resolve a borrowed encoder for a dependent slot started standalone
-    // (e.g. via hotkey) BEFORE taking slot_mtx_. The lookup acquires
-    // SlotManager::mtx_, and the lock order is mtx_ -> slot_mtx_; doing it
-    // while holding slot_mtx_ would invert the order. Callers inside
-    // SlotManager (which hold mtx_) always pass a non-null encoder, so this
-    // locked lookup only runs from the un-locked hotkey/standalone path.
-    if (!cfg_.shared_encoder_slot_id.empty() && !borrowed_venc) {
-        borrowed_venc = SlotManager::instance()
-            .find_encoder_by_slot_id_locked(cfg_.shared_encoder_slot_id);
-        if (!borrowed_venc) {
-            blog(LOG_ERROR, "[multi-scene-rec] '%s': primary slot '%s' not running, cannot start",
-                 cfg_.name.c_str(), cfg_.shared_encoder_slot_id.c_str());
-            running_.store(false);
-            return false;
+    // ---- Resolve the encoder-group key and a COPY of the owner Config
+    //      BEFORE taking slot_mtx_. For a sharing slot this looks up the
+    //      referenced slot's Config via SlotManager (mtx_ taken briefly and
+    //      released inside config_by_slot_id), mirroring the former
+    //      pre-slot_mtx_ resolution. Lock order is mtx_ -> slot_mtx_, and
+    //      acquire_shared_encoder (shared_mtx_, leaf) must run with neither
+    //      mtx_ nor slot_mtx_ held. ----
+    std::string     group_key;
+    SceneSlot::Config owner_cfg;
+    {
+        // Brief unlocked read of cfg_ identity fields only, exactly as the
+        // former pre-slot_mtx_ resolution did.
+        const std::string dep_id = cfg_.shared_encoder_slot_id;
+        if (!dep_id.empty()) {
+            group_key = dep_id;
+            if (!SlotManager::instance().config_by_slot_id(dep_id, owner_cfg)) {
+                blog(LOG_ERROR,
+                     "[multi-scene-rec] '%s': encoder source slot '%s' not found",
+                     cfg_.name.c_str(), dep_id.c_str());
+                running_.store(false);
+                return false;
+            }
+        } else {
+            group_key = cfg_.id;
+            owner_cfg = cfg_;
         }
     }
 
-    // slot_mtx_ guards all SceneSlot members written below (outputs,
-    // encoders, view, scene source, cfg_). Held for the rest of start().
-    // The atomic CAS above remains the fast early-out.
+    // Acquire (or build) the shared encoder context for this group. Takes
+    // shared_mtx_ ONLY (strict leaf): not under mtx_, not under slot_mtx_.
+    SharedEncoder* shared =
+        SlotManager::instance().acquire_shared_encoder(group_key, owner_cfg);
+    if (!shared) {
+        blog(LOG_ERROR,
+             "[multi-scene-rec] '%s': could not acquire shared encoder (group '%s')",
+             cfg_.name.c_str(), group_key.c_str());
+        running_.store(false);
+        return false;
+    }
+
+    // slot_mtx_ guards all per-slot members written below (outputs, audio
+    // encoders, group_key_/venc_, cfg_). Held for the rest of start(). The
+    // atomic CAS above remains the fast early-out.
     std::lock_guard<std::mutex> lk(slot_mtx_);
 
-    // Reset before (re)creating encoders; setup_encoders() sets it true on
-    // the obs_x264/CBR fallback path.
-    encoder_fallback_ = false;
+    // Record what we are consuming so teardown_locked() releases the right
+    // context. venc_ is a borrowed pointer (a strong ref is held on our
+    // behalf by acquire_shared_encoder, dropped by release_shared_encoder).
+    group_key_        = group_key;
+    venc_             = shared->venc_;
+    encoder_fallback_ = shared->encoder_fallback_; // local copy for stats()
 
     if (cfg_.audio_tracks == 0) {
         blog(LOG_WARNING, "[multi-scene-rec] '%s': no audio tracks selected; defaulting to track 1",
@@ -350,49 +495,16 @@ bool SceneSlot::start(obs_encoder_t* borrowed_venc)
         cfg_.replay_enabled = true;
     }
 
+    // The shared context is already acquired, so failures from here on must
+    // go through teardown_locked() to release it (and any per-slot state).
     if (cfg_.path.empty()) {
         blog(LOG_ERROR, "[multi-scene-rec] '%s': output path is empty", cfg_.name.c_str());
-        running_.store(false);
-        return false;
+        running_.store(false); teardown_locked(); return false;
     }
     if (!os_file_exists(cfg_.path.c_str())) {
         blog(LOG_ERROR, "[multi-scene-rec] '%s': output path does not exist: %s",
              cfg_.name.c_str(), cfg_.path.c_str());
-        running_.store(false);
-        return false;
-    }
-
-    const bool is_dependent = !cfg_.shared_encoder_slot_id.empty();
-
-    if (is_dependent) {
-        // Encoder was resolved before slot_mtx_ was taken (see top of
-        // start()); borrowed_venc is guaranteed non-null here.
-        owns_venc_ = false;
-        // Hold a strong reference for the duration of our use. The public API
-        // exposes obs_encoder_get_ref() for this; obs_encoder_addref() is
-        // internal-only (obs-internal.h) and not exported.
-        venc_ = obs_encoder_get_ref(borrowed_venc);
-        if (!venc_) {
-            blog(LOG_ERROR, "[multi-scene-rec] '%s': borrowed encoder is being destroyed",
-                 cfg_.name.c_str());
-            running_.store(false);
-            return false;
-        }
-    } else {
-        owns_venc_ = true;
-
-        scene_src_ = fetch_scene_source(cfg_.scene_name);
-        if (!scene_src_) {
-            blog(LOG_WARNING, "[multi-scene-rec] '%s': scene '%s' not found",
-                 cfg_.name.c_str(), cfg_.scene_name.c_str());
-            running_.store(false);
-            return false;
-        }
-
-        obs_source_inc_showing(scene_src_);
-        showing_held_ = true;
-
-        if (!setup_video()) { running_.store(false); teardown_locked(); return false; }
+        running_.store(false); teardown_locked(); return false;
     }
 
     if (!setup_encoders()) { running_.store(false); teardown_locked(); return false; }
@@ -446,7 +558,7 @@ bool SceneSlot::start(obs_encoder_t* borrowed_venc)
 
 void SceneSlot::stop()
 {
-    if (!running_.exchange(false) && !showing_held_ && !scene_src_) return;
+    if (!running_.exchange(false)) return;
     teardown();
 }
 
@@ -484,11 +596,11 @@ void SceneSlot::wait_for_output_stop(obs_output_t* out)
 //      the handler does not re-enter a half-destroyed slot)
 //   b. wait for each output's async stop to actually complete
 //   c. release the outputs
-//   d. release audio encoders
-//   e. release the video encoder (owned OR borrowed -- we always hold a ref)
-//   f. detach + destroy the per-slot view (clear its source first)
-//   g. drop the scene "showing" reference
-//   h. release the scene source
+//   d. release the per-slot audio encoders
+//   e. release this slot's reference to the shared video-encoder context
+//      (SlotManager destroys scene/view/video/encoder only when the LAST
+//      consumer releases — stopping this slot never tears down a sibling's
+//      pipeline)
 void SceneSlot::teardown_locked()
 {
     // Note: hotkeys are intentionally NOT touched here. Their lifecycle is
@@ -516,117 +628,35 @@ void SceneSlot::teardown_locked()
     if (rec_out_)    { obs_output_release(rec_out_);    rec_out_    = nullptr; }
     if (replay_out_) { obs_output_release(replay_out_); replay_out_ = nullptr; }
 
-    // (d) Release audio encoders.
+    // (d) Release the per-slot audio encoders.
     for (auto* aenc : aencs_) if (aenc) obs_encoder_release(aenc);
     aencs_.clear();
     selected_tracks_.clear();
 
-    // (e) Release the video encoder. We always hold a reference (owned via
-    //     obs_video_encoder_create, or borrowed + obs_encoder_get_ref'd in
-    //     start()), so release unconditionally.
+    // (e) Release this slot's reference to the shared video-encoder context.
+    //     release_shared_encoder() drops the strong ref taken by
+    //     acquire_shared_encoder() and decrements the group's use-count; the
+    //     context (and its scene/view/video/encoder) is destroyed in the
+    //     mandatory encoder->view->scene order ONLY when the last consumer
+    //     releases. shared_mtx_ is a strict LEAF, so calling this while
+    //     holding slot_mtx_ does not invert the lock order. venc_ is non-null
+    //     only after a successful acquire in start().
     if (venc_) {
-        obs_encoder_release(venc_); // release whether owned or borrowed
+        SlotManager::instance().release_shared_encoder(group_key_);
         venc_ = nullptr;
     }
-    owns_venc_ = true;  // reset for next start cycle
-
-    // (f) Detach and destroy the per-slot view. Clear its source first.
-    if (view_) {
-        obs_view_set_source(view_, 0, nullptr);
-        obs_view_remove(view_);
-        obs_view_destroy(view_);
-        view_ = nullptr;
-        video_ = nullptr;
-    }
-
-    // (g) Drop the scene "showing" reference.
-    if (showing_held_ && scene_src_) {
-        obs_source_dec_showing(scene_src_);
-        showing_held_ = false;
-    }
-    // (h) Release the scene source.
-    if (scene_src_) { obs_source_release(scene_src_); scene_src_ = nullptr; }
+    group_key_.clear();
+    encoder_fallback_ = false;
 }
 
 // =============================================================================
-// video setup
-// =============================================================================
-
-bool SceneSlot::setup_video()
-{
-    view_ = obs_view_create();
-    obs_view_set_source(view_, 0, scene_src_);
-
-    struct obs_video_info ovi = {};
-    ovi.fps_num        = cfg_.fps_num;
-    ovi.fps_den        = cfg_.fps_den;
-    ovi.base_width     = cfg_.width;
-    ovi.base_height    = cfg_.height;
-    ovi.output_width   = cfg_.width;
-    ovi.output_height  = cfg_.height;
-    ovi.output_format  = VIDEO_FORMAT_NV12;
-    struct obs_video_info main_ovi = {};
-    obs_get_video_info(&main_ovi);
-    ovi.colorspace     = main_ovi.colorspace;
-    ovi.range          = main_ovi.range;
-    ovi.gpu_conversion = true;
-    ovi.scale_type     = OBS_SCALE_BICUBIC;
-
-    video_ = obs_view_add2(view_, &ovi);
-    if (!video_) {
-        blog(LOG_ERROR, "[multi-scene-rec] obs_view_add2 failed for '%s'",
-             cfg_.name.c_str());
-        return false;
-    }
-    return true;
-}
-
-// =============================================================================
-// encoders
+// encoders (audio only — the video encoder lives in the shared context)
 // =============================================================================
 
 bool SceneSlot::setup_encoders()
 {
-    // ---- video encoder (only when this slot owns its encoder) ----
-    if (owns_venc_) {
-        const std::string enc_id =
-            cfg_.video_encoder_id.empty() ? std::string("obs_x264")
-                                          : cfg_.video_encoder_id;
-
-        obs_data_t* vs = obs_data_create();
-        apply_encoder_settings(vs, enc_id, cfg_);
-        venc_ = obs_video_encoder_create(enc_id.c_str(),
-                                         ("venc_" + cfg_.id).c_str(),
-                                         vs, nullptr);
-        obs_data_release(vs);
-
-        if (!venc_) {
-            // Fall back to x264 + CBR if the requested encoder is unavailable on
-            // this machine. The saved rate control mode may not exist on x264
-            // (e.g. CQP), so force CBR with a safe bitrate.
-            blog(LOG_WARNING,
-                 "[multi-scene-rec] '%s' encoder '%s' unavailable, falling back to obs_x264/CBR",
-                 cfg_.name.c_str(), enc_id.c_str());
-            obs_data_t* fs = obs_data_create();
-            apply_family_presets(fs, "obs_x264", cfg_);
-            obs_data_set_string(fs, "rate_control", "CBR");
-            obs_data_set_int(fs, "bitrate",
-                             rc_util::is_bitrate_based(cfg_.rate_control)
-                                 ? cfg_.rc_value : 6000);
-            venc_ = obs_video_encoder_create("obs_x264",
-                                             ("venc_" + cfg_.id).c_str(),
-                                             fs, nullptr);
-            obs_data_release(fs);
-            if (!venc_) {
-                blog(LOG_ERROR, "[multi-scene-rec] video encoder create failed");
-                return false;
-            }
-            // The user's rate-control configuration was discarded; surface
-            // this in the UI (see Stats::encoder_fallback).
-            encoder_fallback_ = true;
-        }
-        obs_encoder_set_video(venc_, video_);
-    }
+    // The video encoder belongs to the SharedEncoder context acquired in
+    // start(); this slot only builds its own per-slot audio encoders.
 
     // ---- audio encoders: one per selected OBS track ----
     audio_t* main_audio = obs_get_audio();
@@ -768,19 +798,131 @@ void SceneSlot::register_hotkeys()
 {
     if (hotkey_record_ != OBS_INVALID_HOTKEY_ID) return; // already registered
 
+    // Per-slot inert sentinel output. Its sole purpose is to give the two
+    // hotkeys below an obs_output_t* to register against, so OBS Settings >
+    // Hotkeys groups both rows under its name ("Multi-Scene Record: <slot
+    // name>"). Type is "ffmpeg_muxer" because this plugin already uses it
+    // elsewhere (guaranteed present in every supported OBS build); we never
+    // call obs_output_start on it, so its real semantics are irrelevant.
+    //
+    // libobs has no obs_output_set_name, so updating the group label after a
+    // slot rename requires destroying + recreating this output. update_config()
+    // already pairs every rename with unregister_hotkeys() -> register_hotkeys();
+    // since unregister_hotkeys() releases hotkey_out_, the rename naturally
+    // refreshes the label here.
+    std::string group_name = "Multi-Scene Record: " + cfg_.name;
+    hotkey_out_ = obs_output_create("ffmpeg_muxer", group_name.c_str(),
+                                    nullptr, nullptr);
+
     std::string rec_name = "multi_scene_rec.record." + cfg_.id;
     std::string rec_desc = "Toggle Recording: " + cfg_.name;
-    hotkey_record_ = obs_hotkey_register_frontend(
-        rec_name.c_str(), rec_desc.c_str(), &SceneSlot::on_record_hotkey, this);
-
     std::string rep_name = "multi_scene_rec.save_replay." + cfg_.id;
     std::string rep_desc = "Save Replay: " + cfg_.name;
-    hotkey_replay_ = obs_hotkey_register_frontend(
-        rep_name.c_str(), rep_desc.c_str(), &SceneSlot::on_save_hotkey, this);
+
+    if (hotkey_out_) {
+        hotkey_record_ = obs_hotkey_register_output(
+            hotkey_out_, rec_name.c_str(), rec_desc.c_str(),
+            &SceneSlot::on_record_hotkey, this);
+        hotkey_replay_ = obs_hotkey_register_output(
+            hotkey_out_, rep_name.c_str(), rep_desc.c_str(),
+            &SceneSlot::on_save_hotkey, this);
+    } else {
+        // Defensive fallback: if libobs refuses to create the sentinel output
+        // (e.g. OOM, or the hotkey system isn't ready), keep the hotkeys
+        // working by falling back to frontend registration. The user loses the
+        // per-slot group label but not the hotkey itself.
+        blog(LOG_WARNING,
+             "[multi-scene-rec] failed to create hotkey-group output for slot "
+             "'%s'; registering hotkeys under Front-End instead",
+             cfg_.name.c_str());
+        hotkey_record_ = obs_hotkey_register_frontend(
+            rec_name.c_str(), rec_desc.c_str(),
+            &SceneSlot::on_record_hotkey, this);
+        hotkey_replay_ = obs_hotkey_register_frontend(
+            rep_name.c_str(), rep_desc.c_str(),
+            &SceneSlot::on_save_hotkey, this);
+    }
+
+    // Re-apply any saved/captured binding to the now-live hotkey ids.
+    // obs_hotkey_load() binds the live id (same path the Settings dialog uses
+    // to apply a binding); the caller still owns the array and must release.
+    // Mechanism-agnostic — works identically for output- and frontend-
+    // registered hotkeys.
+    if (pending_hk_record_) {
+        if (hotkey_record_ != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_load(hotkey_record_, pending_hk_record_);
+        obs_data_array_release(pending_hk_record_);
+        pending_hk_record_ = nullptr;
+    }
+    if (pending_hk_replay_) {
+        if (hotkey_replay_ != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_load(hotkey_replay_, pending_hk_replay_);
+        obs_data_array_release(pending_hk_replay_);
+        pending_hk_replay_ = nullptr;
+    }
+}
+
+// --- ITEM A: hotkey-binding persistence helpers ------------------------------
+
+void SceneSlot::capture_hotkey_bindings()
+{
+    // Snapshot the live hotkeys into pending_*. obs_hotkey_save() returns a
+    // new array the caller must release; release any stale pending first so
+    // re-entry cannot leak.
+    if (pending_hk_record_) {
+        obs_data_array_release(pending_hk_record_);
+        pending_hk_record_ = nullptr;
+    }
+    if (pending_hk_replay_) {
+        obs_data_array_release(pending_hk_replay_);
+        pending_hk_replay_ = nullptr;
+    }
+    if (hotkey_record_ != OBS_INVALID_HOTKEY_ID)
+        pending_hk_record_ = obs_hotkey_save(hotkey_record_);
+    if (hotkey_replay_ != OBS_INVALID_HOTKEY_ID)
+        pending_hk_replay_ = obs_hotkey_save(hotkey_replay_);
+}
+
+void SceneSlot::save_hotkey_bindings(obs_data_t* d) const
+{
+    // Prefer the live hotkey's current binding; if it is not registered yet
+    // (e.g. a save that lands between load_from and FINISHED_LOADING) fall
+    // back to the not-yet-applied pending_* array so the binding is never
+    // dropped from the durable save. obs_data_set_array does not take
+    // ownership, so release every array we obtained.
+    if (hotkey_record_ != OBS_INVALID_HOTKEY_ID) {
+        obs_data_array_t* a = obs_hotkey_save(hotkey_record_);
+        if (a) { obs_data_set_array(d, "hk_record", a);
+                 obs_data_array_release(a); }
+    } else if (pending_hk_record_) {
+        obs_data_set_array(d, "hk_record", pending_hk_record_);
+    }
+    if (hotkey_replay_ != OBS_INVALID_HOTKEY_ID) {
+        obs_data_array_t* a = obs_hotkey_save(hotkey_replay_);
+        if (a) { obs_data_set_array(d, "hk_save_replay", a);
+                 obs_data_array_release(a); }
+    } else if (pending_hk_replay_) {
+        obs_data_set_array(d, "hk_save_replay", pending_hk_replay_);
+    }
+}
+
+void SceneSlot::set_pending_hotkey_bindings(obs_data_array_t* rec,
+                                            obs_data_array_t* rep)
+{
+    // Takes ownership of rec/rep (each a ref from obs_data_get_array, or
+    // nullptr when the key was absent in an older save). Drop any prior
+    // pending first so a repeated stash cannot leak.
+    if (pending_hk_record_) obs_data_array_release(pending_hk_record_);
+    if (pending_hk_replay_) obs_data_array_release(pending_hk_replay_);
+    pending_hk_record_ = rec;
+    pending_hk_replay_ = rep;
 }
 
 void SceneSlot::unregister_hotkeys()
 {
+    // Order matters: each registered hotkey holds a weak ref to hotkey_out_
+    // (via libobs's hotkey registry). Unregister both before dropping the
+    // strong ref so the weak refs never dangle.
     if (hotkey_record_ != OBS_INVALID_HOTKEY_ID) {
         obs_hotkey_unregister(hotkey_record_);
         hotkey_record_ = OBS_INVALID_HOTKEY_ID;
@@ -788,6 +930,10 @@ void SceneSlot::unregister_hotkeys()
     if (hotkey_replay_ != OBS_INVALID_HOTKEY_ID) {
         obs_hotkey_unregister(hotkey_replay_);
         hotkey_replay_ = OBS_INVALID_HOTKEY_ID;
+    }
+    if (hotkey_out_) {
+        obs_output_release(hotkey_out_);
+        hotkey_out_ = nullptr;
     }
 }
 
@@ -799,11 +945,6 @@ void SceneSlot::on_record_hotkey(void* data, obs_hotkey_id /*id*/,
     if (!self) return;
     if (self->is_running()) {
         self->stop();
-        // A primary stopping via hotkey must also stop dependents that
-        // borrow its encoder; otherwise they keep a stale reference. This
-        // path does not hold SlotManager::mtx_, so acquiring it here keeps
-        // the mtx_ -> slot_mtx_ order.
-        SlotManager::instance().stop_dependents_of(self->config().id);
     } else {
         self->start();
     }
@@ -913,13 +1054,4 @@ void SceneSlot::reset_stats_sampler()
     last_sample_bytes_ns_ = 0;
     last_sample_bytes_    = 0;
     last_kbps_            = 0.0;
-}
-
-obs_encoder_t* SceneSlot::video_encoder() const
-{
-    // slot_mtx_ guards venc_ against concurrent start()/teardown(). Returns
-    // a copy of the pointer. Lock order: callers inside SlotManager hold
-    // mtx_ first (mtx_ -> slot_mtx_); no inner lock is held here.
-    std::lock_guard<std::mutex> lk(slot_mtx_);
-    return venc_;
 }

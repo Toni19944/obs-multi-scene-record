@@ -20,6 +20,20 @@ void SlotManager::shutdown()
     unregister_all_hotkeys();
     std::lock_guard<std::mutex> lk(mtx_);
     slots_.clear();
+
+    // After stop_all() every consumer released, so the registry must already
+    // be empty. Defensively clear it AFTER stop_all() and flag any leak:
+    // erasing runs ~SharedEncoder for any surviving context (encoder->view->
+    // scene order) so nothing leaks across module unload / OBS exit.
+    // shared_mtx_ is a strict leaf; taking it while holding mtx_ keeps the
+    // global order (mtx_ -> ... -> shared_mtx_) and never inverts it.
+    std::lock_guard<std::mutex> slk(shared_mtx_);
+    for (auto& kv : shared_) {
+        blog(LOG_ERROR,
+             "[multi-scene-rec] leaked shared encoder context for group '%s' at shutdown",
+             kv.first.c_str());
+    }
+    shared_.clear();
 }
 
 // ----------------------------------------------------------------------------
@@ -44,28 +58,22 @@ SceneSlot* SlotManager::slot_at(size_t i) const
 
 void SlotManager::add_slot(const SceneSlot::Config& cfg)
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    slots_.emplace_back(std::make_unique<SceneSlot>(cfg));
-    // User-initiated add: the frontend is up, so register hotkeys immediately.
-    slots_.back()->register_hotkeys();
-    if (started_) {
-        const auto& sid = cfg.shared_encoder_slot_id;
-        if (sid.empty()) {
-            slots_.back()->start();
-        } else {
-            // Resolve the borrowed encoder under mtx_. If null (primary not
-            // running) DO NOT call start() with null: start() would re-enter
-            // find_encoder_by_slot_id_locked() and deadlock on mtx_.
-            obs_encoder_t* venc = find_encoder_by_slot_id_unlocked(sid);
-            if (venc) {
-                slots_.back()->start(venc);
-            } else {
-                blog(LOG_ERROR,
-                     "[multi-scene-rec] '%s': primary slot '%s' not running, dependent not started",
-                     cfg.name.c_str(), sid.c_str());
-            }
-        }
+    SceneSlot* added = nullptr;
+    bool start_it = false;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        slots_.emplace_back(std::make_unique<SceneSlot>(cfg));
+        // User-initiated add: the frontend is up, so register hotkeys now.
+        slots_.back()->register_hotkeys();
+        added    = slots_.back().get();
+        start_it = started_;
     }
+    // start() resolves its group key and owner Config under mtx_ itself
+    // (briefly) before acquiring the shared encoder, so it must be called
+    // WITHOUT holding mtx_ (std::mutex is non-recursive). No pre-resolution:
+    // a sharing slot whose owner is not running still starts — the shared
+    // context is built from the owner's persisted Config.
+    if (start_it && added) added->start();
 }
 
 void SlotManager::remove_slot(size_t i)
@@ -73,14 +81,11 @@ void SlotManager::remove_slot(size_t i)
     std::lock_guard<std::mutex> lk(mtx_);
     if (i >= slots_.size()) return;
 
-    const std::string removed_id = slots_[i]->config().id;
-
-    // Stop any dependent slots that borrow this slot's encoder.
-    for (auto& s : slots_) {
-        if (s->config().shared_encoder_slot_id == removed_id && s->is_running())
-            s->stop();
-    }
-
+    // Stopping this slot no longer cascades to other slots: a sharing slot
+    // keeps its own reference to the shared encoder context, which survives
+    // until its own last consumer releases. stop() -> teardown_locked() ->
+    // release_shared_encoder() takes slot_mtx_ then shared_mtx_ (leaf),
+    // preserving mtx_ -> slot_mtx_ -> shared_mtx_.
     slots_[i]->stop();
     slots_[i]->unregister_hotkeys();
     slots_.erase(slots_.begin() + i);
@@ -88,15 +93,17 @@ void SlotManager::remove_slot(size_t i)
 
 void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (i >= slots_.size()) return;
-    // Resolve the borrowed encoder while still under mtx_ so update_config()
-    // (and the start() it triggers) never has to take the locked lookup
-    // path, which would re-enter mtx_ on this thread (deadlock).
-    obs_encoder_t* venc = nullptr;
-    if (!cfg.shared_encoder_slot_id.empty())
-        venc = find_encoder_by_slot_id_unlocked(cfg.shared_encoder_slot_id);
-    slots_[i]->update_config(cfg, venc);
+    SceneSlot* s = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (i >= slots_.size()) return;
+        s = slots_[i].get();
+    }
+    // update_config() may stop() then start(); start() resolves its group
+    // key / owner Config under mtx_ internally, so update_config must run
+    // WITHOUT holding mtx_ (non-recursive). The acquire path replaces the
+    // former pre-resolved encoder argument entirely.
+    s->update_config(cfg);
 }
 
 // ----------------------------------------------------------------------------
@@ -105,31 +112,19 @@ void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
 
 void SlotManager::start_all()
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    started_ = true;
-
-    // Phase 1: start primary slots (those that own their encoder).
-    for (auto& s : slots_) {
-        if (s->config().shared_encoder_slot_id.empty())
-            s->start();
+    std::vector<SceneSlot*> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        started_ = true;
+        snapshot.reserve(slots_.size());
+        for (auto& s : slots_) snapshot.push_back(s.get());
     }
-
-    // Phase 2: start dependent slots (those that borrow an encoder).
-    for (auto& s : slots_) {
-        const auto& sid = s->config().shared_encoder_slot_id;
-        if (!sid.empty()) {
-            obs_encoder_t* venc = find_encoder_by_slot_id_unlocked(sid);
-            if (venc) {
-                s->start(venc);
-            } else {
-                // Never pass null for a dependent from this locked context:
-                // start() would re-enter mtx_ via the locked lookup.
-                blog(LOG_ERROR,
-                     "[multi-scene-rec] '%s': primary slot '%s' not running, dependent not started",
-                     s->config().name.c_str(), sid.c_str());
-            }
-        }
-    }
+    // Single pass; ordering no longer matters because each slot acquires its
+    // shared encoder context independently and an owner need not be running
+    // for a sharing slot to start. start() resolves its group key / owner
+    // Config under mtx_ internally, so it must run OUTSIDE mtx_ (non-
+    // recursive). External contract is unchanged: every slot is started.
+    for (auto* s : snapshot) s->start();
 }
 
 void SlotManager::stop_all()
@@ -137,18 +132,6 @@ void SlotManager::stop_all()
     std::lock_guard<std::mutex> lk(mtx_);
     started_ = false;
     for (auto& s : slots_) s->stop();
-}
-
-void SlotManager::stop_dependents_of(const std::string& primary_slot_id)
-{
-    // mtx_ guards slots_. Each s->stop() -> teardown() takes slot_mtx_,
-    // preserving the mtx_ -> slot_mtx_ order.
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (auto& s : slots_) {
-        if (s->config().shared_encoder_slot_id == primary_slot_id &&
-            s->is_running())
-            s->stop();
-    }
 }
 
 void SlotManager::register_all_hotkeys()
@@ -163,19 +146,93 @@ void SlotManager::unregister_all_hotkeys()
     for (auto& s : slots_) s->unregister_hotkeys();
 }
 
-obs_encoder_t* SlotManager::find_encoder_by_slot_id_unlocked(const std::string& slot_id) const
+bool SlotManager::config_by_slot_id(const std::string& slot_id,
+                                    SceneSlot::Config& out) const
 {
+    // Brief: takes mtx_ and releases it before returning so the caller
+    // (SceneSlot::start()) can go on to take shared_mtx_ then slot_mtx_
+    // without ever holding two of them at once.
+    std::lock_guard<std::mutex> lk(mtx_);
     for (auto& s : slots_) {
-        if (s->config().id == slot_id && s->is_running())
-            return s->video_encoder();
+        if (s->config().id == slot_id) {
+            out = s->config();   // copy under mtx_
+            return true;
+        }
     }
-    return nullptr;
+    return false;
 }
 
-obs_encoder_t* SlotManager::find_encoder_by_slot_id_locked(const std::string& slot_id) const
+// ----------------------------------------------------------------------------
+// shared-encoder registry
+//
+// LOCKING: shared_mtx_ is a strict LEAF. acquire/release take ONLY
+// shared_mtx_ and must never take mtx_ or slot_mtx_, and must not hold
+// shared_mtx_ across any other lock acquisition. Callers resolve the owner
+// Config beforehand (config_by_slot_id, under mtx_ briefly) and pass it by
+// value. start() calls acquire AFTER releasing that mtx_ lookup and BEFORE
+// taking slot_mtx_; teardown_locked() calls release while holding slot_mtx_
+// (allowed: shared_mtx_ is a leaf, never held while taking slot_mtx_/mtx_).
+// Global order therefore remains mtx_ -> slot_mtx_ -> shared_mtx_.
+// ----------------------------------------------------------------------------
+
+SharedEncoder* SlotManager::acquire_shared_encoder(
+    const std::string& group_key, const SceneSlot::Config& owner_cfg)
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return find_encoder_by_slot_id_unlocked(slot_id);
+    std::lock_guard<std::mutex> lk(shared_mtx_);
+
+    auto it = shared_.find(group_key);
+    if (it == shared_.end()) {
+        // First consumer for this group builds the context from the owner
+        // Config. Concurrent first-start of the same group is serialized by
+        // shared_mtx_: the first builds, every other find-and-increments.
+        // A slot joining an existing context uses that context's (possibly
+        // older) settings until use_count returns to 0 and it is rebuilt.
+        auto ctx = std::make_unique<SharedEncoder>();
+        if (!ctx->build(owner_cfg)) {
+            blog(LOG_ERROR,
+                 "[multi-scene-rec] failed to build shared encoder for group '%s'",
+                 group_key.c_str());
+            return nullptr; // ctx destroyed here -> partial cleanup in dtor
+        }
+        it = shared_.emplace(group_key, std::move(ctx)).first;
+    }
+
+    SharedEncoder* ctx = it->second.get();
+    // Hand the caller its own strong ref (the matching final release of the
+    // creation ref happens in release_shared_encoder when use_count hits 0).
+    obs_encoder_t* ref = obs_encoder_get_ref(ctx->venc_);
+    if (!ref) {
+        blog(LOG_ERROR,
+             "[multi-scene-rec] shared encoder for group '%s' is being destroyed",
+             group_key.c_str());
+        if (ctx->use_count_ == 0)
+            shared_.erase(it); // nothing else holds it; drop the dead context
+        return nullptr;
+    }
+    ++ctx->use_count_;
+    return ctx;
+}
+
+void SlotManager::release_shared_encoder(const std::string& group_key)
+{
+    std::lock_guard<std::mutex> lk(shared_mtx_);
+
+    auto it = shared_.find(group_key);
+    if (it == shared_.end()) return; // defensive: never built / already gone
+    SharedEncoder* ctx = it->second.get();
+
+    // Release the caller's consumer ref (taken via obs_encoder_get_ref in
+    // acquire_shared_encoder) and decrement the group's use-count.
+    if (ctx->venc_) obs_encoder_release(ctx->venc_);
+    if (ctx->use_count_ > 0) --ctx->use_count_;
+
+    // Last consumer: destroy the context. ~SharedEncoder performs the
+    // mandatory order — final encoder release (matching create), then view
+    // (set_source null / remove / destroy), then scene (dec_showing /
+    // release). Erasing under shared_mtx_ runs that dtor synchronously, so
+    // a subsequent rebuild for the same key cannot collide.
+    if (ctx->use_count_ == 0)
+        shared_.erase(it);
 }
 
 std::string SlotManager::slot_name_by_id(const std::string& slot_id) const
@@ -376,6 +433,11 @@ void SlotManager::save_to(obs_data_t* save_data)
         std::lock_guard<std::mutex> lk(mtx_);
         for (auto& s : slots_) {
             obs_data_t* d = slot_to_data(s->config());
+            // ITEM A: also persist this slot's two hotkey bindings into the
+            // same per-slot obs_data under stable keys. Done here (not in
+            // slot_to_data, which only sees a Config) because it needs the
+            // live SceneSlot. slot_to_data's contract is unchanged.
+            s->save_hotkey_bindings(d);
             obs_data_array_push_back(arr, d);
             obs_data_release(d);
         }
@@ -401,6 +463,16 @@ void SlotManager::load_from(obs_data_t* save_data)
             obs_data_t* d = obs_data_array_item(arr, i);
             SceneSlot::Config c = slot_from_data(d);
             slots_.emplace_back(std::make_unique<SceneSlot>(c));
+            // ITEM A: hotkeys are registered later (FINISHED_LOADING /
+            // SCENE_COLLECTION_CHANGED), so stash the saved bindings on the
+            // new slot now; register_hotkeys() applies+releases them. Each
+            // obs_data_get_array returns a ref this loop owns; ownership is
+            // transferred to the slot (do not release here). Absent keys
+            // (older saves / freshly added slots) -> nullptr -> normal
+            // registration with no binding to restore.
+            obs_data_array_t* hkr = obs_data_get_array(d, "hk_record");
+            obs_data_array_t* hkp = obs_data_get_array(d, "hk_save_replay");
+            slots_.back()->set_pending_hotkey_bindings(hkr, hkp);
             obs_data_release(d);
         }
         // slots_ was rebuilt: invalidate any cached raw SceneSlot* held by

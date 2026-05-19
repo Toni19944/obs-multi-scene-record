@@ -34,6 +34,11 @@ private slots:
     void on_stats_toggled(bool on);
 
 private:
+    // ITEM C: COL_STATE is a per-row clickable toggle (cell widget). Clicking
+    // row `row`'s control starts it if stopped / stops it if running, then
+    // refreshes so the row shows the slot's true state.
+    void on_state_clicked(int row);
+
     int  current_row() const;
     void apply_stats_visibility();
     void save_pref_stats_enabled(bool on);
