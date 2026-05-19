@@ -14,16 +14,6 @@ Shared encoder option does exist in this plugin, but you can only select the enc
 
 ---
 
-## Heads up
-
-This plugin was built with the help of Claude AI (Opus 4.7 and 4.6 for code, Sonnet 4.6 for prompting and auditing). I know some of you hate AI-assisted code more than anything — fair enough, figured I'd be upfront about it rather than pretend otherwise.  
-
-That said, the plugin has been code-audited, the OBS API usage has been verified against OBS 30.x internals, and it works. I am fairly certain that the code is not perfect. But it works now and this was as far as I could bring it and clean it with my knowhow and non existent expertise. In this stage, finding someone with actual knowledge to help maintain, audit/clean the project would be nice.
-
-**If you have actual OBS plugin development experience and want to take over maintaining this properly, I'm genuinely happy to hand it over.** If a future OBS update breaks something and I'm not around to fix it, I'd rather it be in capable hands than go abandoned.
-
----
-
 ## Features
 
 - Independent per-slot recording output — each slot gets its own video pipeline, fully isolated from the stream and from each other
