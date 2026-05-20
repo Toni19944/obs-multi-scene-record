@@ -548,7 +548,10 @@ bool SceneSlot::start()
 		}
 	}
 
-	running_.store(true);
+	// F-S1: no running_.store(true) here -- the CAS at the top of start()
+	// already set running_=true, and every failure path between resets it
+	// to false via running_.store(false); teardown_locked(); return false;
+	// before reaching this point.
 
 	char tracks_str[16] = {0};
 	int pos = 0;

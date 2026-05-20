@@ -814,7 +814,7 @@ void SlotEditor::set_form_row_visible(QFormLayout* fl, QWidget* field, bool visi
 
 void SlotEditor::populate_combo_from_encoder_property(
     QComboBox* combo,
-    const std::string& enc_id,
+    obs_properties_t* props,
     const char* prop_key,
     const std::string& current_val,
     bool add_empty_first)
@@ -823,8 +823,8 @@ void SlotEditor::populate_combo_from_encoder_property(
     if (add_empty_first)
         combo->addItem("(encoder default)", QString(""));
 
-    obs_properties_t* props =
-        enc_id.empty() ? nullptr : obs_get_encoder_properties(enc_id.c_str());
+    // F-USE1: props is borrowed from the caller's single obs_get_encoder_properties
+    // call. Do NOT destroy it here -- the caller owns the lifetime.
     if (props) {
         obs_property_t* p = obs_properties_get(props, prop_key);
         if (p && obs_property_get_type(p) == OBS_PROPERTY_LIST) {
@@ -837,7 +837,6 @@ void SlotEditor::populate_combo_from_encoder_property(
                                QString::fromUtf8(val));
             }
         }
-        obs_properties_destroy(props);
     }
 
     // Select configured value; fall back to index 0.
@@ -863,6 +862,14 @@ void SlotEditor::update_encoder_specific_ui()
     const bool is_hevc = (codec == "hevc");
     const bool is_av1  = (codec == "av1");
 
+    // F-USE1: fetch obs_get_encoder_properties ONCE for this update and reuse
+    // it across every populate_combo_from_encoder_property call below. The
+    // former implementation re-fetched + re-destroyed the properties object
+    // four times (preset / profile / tune / multipass) for the same encoder.
+    // May be null (e.g., enc_id empty); helpers handle null gracefully.
+    obs_properties_t* props =
+        enc_id.empty() ? nullptr : obs_get_encoder_properties(enc_id.c_str());
+
     // ---- Repopulate combos ----
 
     // Preset: introspect the encoder-appropriate property key.
@@ -872,7 +879,7 @@ void SlotEditor::update_encoder_specific_ui()
         const bool has_preset = is_x264 || is_nvenc || is_amf || is_qsv;
         if (has_preset) {
             populate_combo_from_encoder_property(
-                encoder_preset_combo_, enc_id, pkey, cfg_.encoder_preset);
+                encoder_preset_combo_, props, pkey, cfg_.encoder_preset);
         }
         set_form_row_visible(form_, encoder_preset_combo_,
                              has_preset && encoder_preset_combo_->count() > 0);
@@ -883,7 +890,7 @@ void SlotEditor::update_encoder_specific_ui()
         const bool has_profile = is_x264 || is_nvenc || is_amf || is_qsv || is_vt;
         if (has_profile) {
             populate_combo_from_encoder_property(
-                encoder_profile_combo_, enc_id, "profile", cfg_.encoder_profile);
+                encoder_profile_combo_, props, "profile", cfg_.encoder_profile);
         }
         set_form_row_visible(form_, encoder_profile_combo_,
                              has_profile && encoder_profile_combo_->count() > 0);
@@ -894,7 +901,7 @@ void SlotEditor::update_encoder_specific_ui()
         const bool has_tune = is_x264 || is_nvenc;
         if (has_tune) {
             populate_combo_from_encoder_property(
-                encoder_tune_combo_, enc_id, "tune", cfg_.encoder_tune, true);
+                encoder_tune_combo_, props, "tune", cfg_.encoder_tune, true);
             // add_empty_first=true adds "(encoder default)" at top for tune,
             // which lets users deselect a tune without picking a specific one.
         }
@@ -906,11 +913,15 @@ void SlotEditor::update_encoder_specific_ui()
     {
         if (is_nvenc) {
             populate_combo_from_encoder_property(
-                multipass_combo_, enc_id, "multipass", cfg_.multipass);
+                multipass_combo_, props, "multipass", cfg_.multipass);
         }
         set_form_row_visible(form_, multipass_combo_,
                              is_nvenc && multipass_combo_->count() > 0);
     }
+
+    // F-USE1: destroy the hoisted properties object exactly once after all
+    // combo populations are done. Safe to call on null.
+    if (props) obs_properties_destroy(props);
 
     // ---- Main form visibility ----
 

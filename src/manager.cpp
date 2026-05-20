@@ -140,9 +140,20 @@ void SlotManager::start_all()
 
 void SlotManager::stop_all()
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    started_ = false;
-    for (auto& s : slots_) s->stop();
+    // F-M1: mirror start_all's snapshot-then-iterate pattern. Each per-slot
+    // s->stop() can block up to ~5s inside SceneSlot::wait_for_output_stop;
+    // holding mtx_ across N stops would freeze every other mtx_ reader (dock
+    // refresh, slot_count, slot_at, ...) for the duration. Snapshot the raw
+    // pointers under mtx_ once, release mtx_, then iterate. Lock order is
+    // unaffected (mtx_ -> slot_mtx_ inside each s->stop()).
+    std::vector<SceneSlot*> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        started_ = false;
+        snapshot.reserve(slots_.size());
+        for (auto& s : slots_) snapshot.push_back(s.get());
+    }
+    for (auto* s : snapshot) s->stop();
 }
 
 void SlotManager::register_all_hotkeys()

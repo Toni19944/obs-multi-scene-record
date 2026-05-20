@@ -43,16 +43,19 @@ private:
     //   everything else            → "preset"
     static const char* preset_prop_key(const std::string& enc_id);
 
-    // Populates `combo` from a list-type property `prop_key` exposed by encoder `enc_id`.
-    // Introspects obs_get_encoder_properties(enc_id). Clears the combo first.
-    // After population, selects the entry whose data() == QString::fromStdString(current_val).
-    // If not found, selects index 0. If the property is absent or has no items,
-    // the combo remains empty (caller handles the empty case).
-    // If add_empty_first is true, inserts an "(encoder default)" entry (data="") at index 0
-    // before populating from the property.
+    // Populates `combo` from a list-type property `prop_key` on a pre-fetched
+    // obs_properties_t* `props`. The caller owns `props` (acquired ONCE per
+    // update_encoder_specific_ui via obs_get_encoder_properties, destroyed
+    // ONCE at the end) -- F-USE1: avoids re-fetching properties per combo.
+    // `props` may be null; the combo is then left empty (or with just the
+    // empty placeholder when `add_empty_first` is true). Clears the combo
+    // first. After population, selects the entry whose data() ==
+    // QString::fromStdString(current_val); falls back to index 0 if not
+    // found. If `add_empty_first` is true, inserts an "(encoder default)"
+    // entry (data="") at index 0 before populating from the property.
     static void populate_combo_from_encoder_property(
         QComboBox* combo,
-        const std::string& enc_id,
+        obs_properties_t* props,
         const char* prop_key,
         const std::string& current_val,
         bool add_empty_first = false);
