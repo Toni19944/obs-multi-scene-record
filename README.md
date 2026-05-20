@@ -23,6 +23,8 @@ Shared encoder option does exist in this plugin, but you can only select the enc
 - Per-slot resolution and FPS — each slot can output at a different resolution and frame rate
 - Per-slot video encoder selection — picks up all encoders available on your machine (NVENC, AMF, QSV, x264, etc.)
   - You can also use existing slots encoder to reduce encoder overhead.
+- Advanced encoder settings (min/max-QP, Dynamic Bitrate, AQ, +more...)
+   - These are set to encoder-defaults unless deliberately set by the user. Advanced settings are only enabled when "advanced encoder settings" checkbox is checked.
 - Per-slot rate control — introspects the selected encoder's actual supported modes (CBR, CQP, CRF, VBR, etc.), not a hardcoded list
 - Per-slot audio encoder selection — choose per slot (AAC, Opus, etc.)
 - Per-slot audio track selection — select any combination of OBS's 6 audio mixer tracks per slot
