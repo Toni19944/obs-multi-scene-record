@@ -33,6 +33,7 @@ Shared encoder option does exist in this plugin, but you can only select the enc
 - Per-slot container format (MKV, MP4, MOV, FLV, TS)
 - Per-slot replay buffer duration
 - Per-slot hotkeys — toggle recording and save replay independently for each slot
+  - Toggling per-slot state via UI instead of a hotkey works from the leftmost column of the dock; that one where it says "off" by default :)
 - Stats display — frames, dropped frames, live bitrate per slot, toggleable (polling stops when disabled)
 - Full persistence — slot configs saved and restored per scene collection
 - Dockable UI panel
