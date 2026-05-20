@@ -146,6 +146,19 @@ void MultiSceneRecordDock::refresh()
     const int n = (int)mgr.slot_count();
 
     table_->setRowCount(n);
+
+    // F-UD1: reuse existing QTableWidgetItem objects instead of reallocating
+    // 8 items per row per refresh(). Mirrors COL_STATE's cell-widget reuse
+    // (feature 004 F2). Only allocates a new item when the cell is empty
+    // (newly added row). Mutate-in-place is internally near-free in Qt.
+    auto set_text = [this](int row, int col, const QString& text) {
+        if (auto* it = table_->item(row, col)) {
+            it->setText(text);
+        } else {
+            table_->setItem(row, col, mk_item(text));
+        }
+    };
+
     for (int i = 0; i < n; ++i) {
         SceneSlot* s = mgr.slot_at((size_t)i);
         if (!s) continue;
@@ -175,26 +188,26 @@ void MultiSceneRecordDock::refresh()
                 table_->setCellWidget(i, COL_STATE, sb);
             }
         }
-        table_->setItem(i, COL_NAME,   mk_item(QString::fromStdString(c.name)));
-        table_->setItem(i, COL_SCENE,  mk_item(QString::fromStdString(c.scene_name)));
-        table_->setItem(i, COL_RES,
-            mk_item(QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num)));
+        set_text(i, COL_NAME,  QString::fromStdString(c.name));
+        set_text(i, COL_SCENE, QString::fromStdString(c.scene_name));
+        set_text(i, COL_RES,
+            QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num));
         if (!c.shared_encoder_slot_id.empty()) {
-            std::string primary_name = SlotManager::instance().slot_name_by_id(c.shared_encoder_slot_id);
+            std::string primary_name = mgr.slot_name_by_id(c.shared_encoder_slot_id);
             QString display = primary_name.empty()
                 ? QString::fromUtf8("\xe2\x86\x92 [deleted]")
                 : QString::fromUtf8("\xe2\x86\x92 ") + QString::fromStdString(primary_name);
-            table_->setItem(i, COL_ENC, mk_item(display));
+            set_text(i, COL_ENC, display);
         } else {
-            table_->setItem(i, COL_ENC, mk_item(QString::fromStdString(c.video_encoder_id)));
+            set_text(i, COL_ENC, QString::fromStdString(c.video_encoder_id));
         }
-        table_->setItem(i, COL_FRAMES, mk_item("--"));
-        table_->setItem(i, COL_DROPPED, mk_item("--"));
-        table_->setItem(i, COL_KBPS,   mk_item("--"));
-        table_->setItem(i, COL_REPLAY,
-            mk_item(c.replay_enabled
-                    ? QString("%1s").arg(c.replay_seconds)
-                    : QString("--")));
+        set_text(i, COL_FRAMES,  "--");
+        set_text(i, COL_DROPPED, "--");
+        set_text(i, COL_KBPS,    "--");
+        set_text(i, COL_REPLAY,
+            c.replay_enabled
+                ? QString("%1s").arg(c.replay_seconds)
+                : QString("--"));
     }
 
     // F1: gate the 1 Hz stats QTimer on real activity. refresh() runs after
