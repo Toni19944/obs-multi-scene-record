@@ -49,18 +49,13 @@ IntRange introspect_int_range(obs_properties_t* props, const char* key)
 
 // First quality-value property the encoder actually exposes, with its range.
 // Returns {found=false} if the encoder has no recognised quality key.
-// Walks rc_util::quality_keys() then quality_split_keys() — the same lists
-// the encoder-build write site (set_quality_value in slot.cpp) consumes, so
-// the editor's range source and the encoder's write target are derived from
-// the same canonical list by construction.
 IntRange introspect_quality_range(obs_properties_t* props)
 {
-    for (const char* const* k = rc_util::quality_keys(); *k; ++k) {
-        IntRange r = introspect_int_range(props, *k);
-        if (r.found) return r;
-    }
-    for (const char* const* k = rc_util::quality_split_keys(); *k; ++k) {
-        IntRange r = introspect_int_range(props, *k);
+    const char* keys[] = {
+        "crf", "cqp", "cq_level", "qp", "icq_quality", "global_quality", "qpi"
+    };
+    for (const char* k : keys) {
+        IntRange r = introspect_int_range(props, k);
         if (r.found) return r;
     }
     return {};
@@ -76,8 +71,7 @@ SlotEditor::SlotEditor(QWidget* parent, SceneSlot::Config cfg)
     : QDialog(parent), cfg_(std::move(cfg))
 {
     setWindowTitle("Slot Configuration");
-    resize(700, 900);
-    cached_avail_mb_ = replay_buffer_util::available_physical_mb();
+    resize(520, 640);
 
     form_ = new QFormLayout;
     auto* form = form_;
@@ -392,51 +386,6 @@ SlotEditor::SlotEditor(QWidget* parent, SceneSlot::Config cfg)
     replay_secs_->setValue((int)cfg_.replay_seconds); replay_secs_->setSuffix(" s");
     form->addRow("Replay length", replay_secs_);
 
-    replay_max_size_spin_ = new QSpinBox;
-    replay_max_size_spin_->setRange(0, 65536);
-    replay_max_size_spin_->setSuffix(" MB");
-    replay_max_size_spin_->setSpecialValueText("Auto");
-    replay_max_size_spin_->setValue((int)cfg_.replay_max_size_mb);
-    replay_max_size_spin_->setToolTip(QString::fromUtf8(
-        "Memory ceiling for the replay buffer.\n\n"
-        "Empty / 0 (Auto): sized automatically from "
-        "resolution \xc3\x97 fps \xc3\x97 replay seconds \xc3\x97 2\xc3\x97 safety margin, "
-        "calibrated for typical high-quality settings "
-        "(around CQP-17 / CRF-18). The resolved value is shown "
-        "alongside this field.\n\n"
-        "Positive integer: overrides the auto-derived value verbatim. "
-        "Set higher if you use an extreme-quality setting "
-        "and see \"suspected memory cap\" warnings in the log; "
-        "set lower to cap RAM use at the cost of shorter saved clips."));
-    replay_max_size_label_ = new QLabel;
-    auto* mb_row = new QHBoxLayout;
-    mb_row->addWidget(replay_max_size_spin_);
-    mb_row->addWidget(replay_max_size_label_, 1);
-    auto* mb_row_wrap = new QWidget;
-    mb_row_wrap->setLayout(mb_row);
-    form->addRow("Max replay buffer size", mb_row_wrap);
-
-    {
-        auto refresh = [this]() { on_replay_max_size_inputs_changed(); };
-        connect(replay_max_size_spin_, QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(replay_secs_,          QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(w_spin_,               QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(h_spin_,               QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(fps_num_spin_,         QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(fps_den_spin_,         QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        connect(rc_combo_,             QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this, refresh);
-        connect(rc_value_spin_,        QOverload<int>::of(&QSpinBox::valueChanged),
-                this, refresh);
-        refresh();
-    }
-
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     connect(buttons, &QDialogButtonBox::accepted, this, &SlotEditor::on_accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -574,7 +523,8 @@ void SlotEditor::populate_audio_encoder_combo()
     }
 }
 
-void SlotEditor::populate_rate_control_combo(obs_properties_t* props)
+// Introspect the selected encoder for its supported rate control modes.
+void SlotEditor::populate_rate_control_combo()
 {
     loading_ = true;
     rc_combo_->clear();
@@ -582,11 +532,8 @@ void SlotEditor::populate_rate_control_combo(obs_properties_t* props)
     const std::string enc_id =
         venc_combo_->currentData().toString().toStdString();
 
-    bool own_props = false;
-    if (!props && !enc_id.empty()) {
-        props = obs_get_encoder_properties(enc_id.c_str());
-        own_props = true;
-    }
+    obs_properties_t* props =
+        enc_id.empty() ? nullptr : obs_get_encoder_properties(enc_id.c_str());
 
     if (props) {
         obs_property_t* rc = obs_properties_get(props, "rate_control");
@@ -600,12 +547,14 @@ void SlotEditor::populate_rate_control_combo(obs_properties_t* props)
                                    QString::fromUtf8(val));
             }
         }
-        if (own_props) obs_properties_destroy(props);
+        obs_properties_destroy(props);
     }
 
+    // Fallback if the encoder didn't expose a rate_control list at all.
     if (rc_combo_->count() == 0)
         rc_combo_->addItem("CBR", "CBR");
 
+    // Select the configured mode, or fall back to the first available.
     QString want = QString::fromStdString(
         cfg_.rate_control.empty() ? "CBR" : cfg_.rate_control);
     int idx = rc_combo_->findData(want);
@@ -618,7 +567,9 @@ void SlotEditor::populate_rate_control_combo(obs_properties_t* props)
 // dynamic value field
 // =============================================================================
 
-void SlotEditor::update_rc_value_field(obs_properties_t* props)
+// Relabel + re-range the value spinbox for the currently selected rate
+// control mode, using introspected property ranges where available.
+void SlotEditor::update_rc_value_field()
 {
     const std::string enc_id =
         venc_combo_->currentData().toString().toStdString();
@@ -637,11 +588,8 @@ void SlotEditor::update_rc_value_field(obs_properties_t* props)
     rc_value_spin_->setEnabled(true);
     rc_value_spin_->setSpecialValueText("");
 
-    bool own_props = false;
-    if (!props && !enc_id.empty()) {
-        props = obs_get_encoder_properties(enc_id.c_str());
-        own_props = true;
-    }
+    obs_properties_t* props =
+        enc_id.empty() ? nullptr : obs_get_encoder_properties(enc_id.c_str());
 
     if (rc_util::is_bitrate_based(mode)) {
         rc_value_label_->setText("Bitrate");
@@ -649,12 +597,14 @@ void SlotEditor::update_rc_value_field(obs_properties_t* props)
         IntRange r = props ? introspect_int_range(props, "bitrate") : IntRange{};
         if (r.found) rc_value_spin_->setRange(std::max(1, r.min), r.max);
         else         rc_value_spin_->setRange(500, 300000);
+        // Keep value if it's sane for a bitrate; otherwise default.
         if (cfg_.rc_value < (uint32_t)rc_value_spin_->minimum() ||
             cfg_.rc_value > (uint32_t)rc_value_spin_->maximum())
             rc_value_spin_->setValue(std::min(6000, rc_value_spin_->maximum()));
         else
             rc_value_spin_->setValue((int)cfg_.rc_value);
     } else {
+        // Quality-based mode (CQP / CRF / CQ / ICQ / ...).
         rc_value_label_->setText("Quality (lower = better)");
         rc_value_spin_->setSuffix("");
         IntRange r = props ? introspect_quality_range(props) : IntRange{};
@@ -670,7 +620,7 @@ void SlotEditor::update_rc_value_field(obs_properties_t* props)
         }
     }
 
-    if (own_props && props) obs_properties_destroy(props);
+    if (props) obs_properties_destroy(props);
 }
 
 // =============================================================================
@@ -684,58 +634,10 @@ void SlotEditor::on_encoder_changed()
     const QString data = venc_combo_->currentData().toString();
     const bool is_shared = data.startsWith("shared:");
 
-    // FR-016: a consumer → standalone transition within an open editor
-    // session must seed cfg_.rate_control / cfg_.rc_value with valid defaults
-    // for the newly-selected encoder, otherwise populate_rate_control_combo
-    // and update_rc_value_field would see the "<inherited>" sentinel + 0 the
-    // consumer state carried in (or stale values from a previous standalone
-    // selection). The previously-consumer state is detected by
-    // shared_encoder_slot_id being non-empty when this handler fires; the
-    // sentinel value of rate_control is the typical precondition but the
-    // seeding rule applies regardless of the prior persisted shape.
-    const bool was_consumer = !cfg_.shared_encoder_slot_id.empty();
-    if (was_consumer && !is_shared) {
-        cfg_.shared_encoder_slot_id.clear();
-        cfg_.video_encoder_id = data.toStdString();
-        if (cfg_.video_encoder_id.empty()) cfg_.video_encoder_id = "obs_x264";
-
-        std::string seeded_mode;
-        int seeded_value = 0;
-        bool have_range = false;
-        obs_properties_t* props = obs_get_encoder_properties(cfg_.video_encoder_id.c_str());
-        if (props) {
-            obs_property_t* rc = obs_properties_get(props, "rate_control");
-            if (rc && obs_property_get_type(rc) == OBS_PROPERTY_LIST &&
-                obs_property_list_item_count(rc) > 0) {
-                const char* first = obs_property_list_item_string(rc, 0);
-                if (first && *first) seeded_mode = first;
-            }
-            if (!seeded_mode.empty() && !rc_util::is_lossless(seeded_mode)) {
-                IntRange r = rc_util::is_bitrate_based(seeded_mode)
-                                 ? introspect_int_range(props, "bitrate")
-                                 : introspect_quality_range(props);
-                if (r.found) {
-                    seeded_value = (r.min + r.max) / 2;
-                    have_range = true;
-                }
-            }
-            obs_properties_destroy(props);
-        }
-        cfg_.rate_control = seeded_mode.empty() ? std::string("CBR") : seeded_mode;
-        // When no range was introspected, leave rc_value at 0 — update_rc_value_field
-        // will snap the spinbox to the field's minimum, and the user can edit
-        // before clicking Save.
-        cfg_.rc_value = have_range ? (uint32_t)std::max(0, seeded_value) : 0u;
-    }
-
     if (!is_shared) {
-        const std::string enc_id = venc_combo_->currentData().toString().toStdString();
-        obs_properties_t* props = enc_id.empty() ? nullptr
-            : obs_get_encoder_properties(enc_id.c_str());
-        populate_rate_control_combo(props);
-        update_rc_value_field(props);
-        update_encoder_specific_ui(props);
-        if (props) obs_properties_destroy(props);
+        populate_rate_control_combo();
+        update_rc_value_field();
+        update_encoder_specific_ui();
     }
     update_shared_encoder_visibility();
 }
@@ -791,13 +693,6 @@ void SlotEditor::on_accept()
     if (venc_data.startsWith("shared:")) {
         cfg_.shared_encoder_slot_id = venc_data.mid(7).toStdString();
         cfg_.video_encoder_id.clear();
-        // Symmetric save-side write (Decision 2 / FR-006): a consumer slot
-        // must never persist standalone rate-control values. The sentinel +
-        // zero are what slot_from_data also writes at load. The unconditional
-        // rc_combo_/rc_value_spin_ read below is guarded by the same
-        // !shared_encoder_slot_id.empty() check so these writes survive.
-        cfg_.rate_control = "<inherited>";
-        cfg_.rc_value     = 0;
     } else {
         cfg_.shared_encoder_slot_id.clear();
         cfg_.video_encoder_id = venc_data.toStdString();
@@ -858,19 +753,14 @@ void SlotEditor::on_accept()
     cfg_.audio_encoder_id = aenc_combo_->currentData().toString().toStdString();
     if (cfg_.audio_encoder_id.empty()) cfg_.audio_encoder_id = "ffmpeg_aac";
 
-    // Rate control: only persist standalone values for own-encoder slots.
-    // The consumer branch above already wrote the sentinel + 0.
-    if (cfg_.shared_encoder_slot_id.empty()) {
-        cfg_.rate_control = rc_combo_->currentData().toString().toStdString();
-        if (cfg_.rate_control.empty()) cfg_.rate_control = "CBR";
-        cfg_.rc_value = (uint32_t)rc_value_spin_->value();
-    }
+    cfg_.rate_control = rc_combo_->currentData().toString().toStdString();
+    if (cfg_.rate_control.empty()) cfg_.rate_control = "CBR";
+    cfg_.rc_value = (uint32_t)rc_value_spin_->value();
 
     cfg_.audio_bitrate  = (uint32_t)abitrate_spin_->value();
     cfg_.replay_enabled = replay_check_->isChecked();
     cfg_.replay_only    = replay_only_check_->isChecked() && cfg_.replay_enabled;
     cfg_.replay_seconds = (uint32_t)replay_secs_->value();
-    cfg_.replay_max_size_mb = (uint32_t)replay_max_size_spin_->value();
 
     cfg_.audio_tracks = 0;
     for (int i = 0; i < 6; ++i)
@@ -954,28 +844,31 @@ void SlotEditor::populate_combo_from_encoder_property(
     combo->setCurrentIndex(idx >= 0 ? idx : 0);
 }
 
-void SlotEditor::update_encoder_specific_ui(obs_properties_t* ext_props)
+void SlotEditor::update_encoder_specific_ui()
 {
     const std::string enc_id =
         venc_combo_->currentData().toString().toStdString();
 
+    // Determine encoder family.
     const bool is_x264  = enc_has(enc_id, "x264");
     const bool is_nvenc = enc_has(enc_id, "nvenc");
     const bool is_amf   = enc_has(enc_id, "amf");
     const bool is_qsv   = enc_has(enc_id, "qsv");
     const bool is_vt    = enc_has(enc_id, "videotoolbox") || enc_has(enc_id, "apple");
 
+    // Determine codec for HEVC/AV1 visibility.
     const char* raw_codec = obs_get_encoder_codec(enc_id.c_str());
     const std::string codec = raw_codec ? raw_codec : "";
     const bool is_hevc = (codec == "hevc");
     const bool is_av1  = (codec == "av1");
 
-    bool own_props = false;
-    obs_properties_t* props = ext_props;
-    if (!props && !enc_id.empty()) {
-        props = obs_get_encoder_properties(enc_id.c_str());
-        own_props = true;
-    }
+    // F-USE1: fetch obs_get_encoder_properties ONCE for this update and reuse
+    // it across every populate_combo_from_encoder_property call below. The
+    // former implementation re-fetched + re-destroyed the properties object
+    // four times (preset / profile / tune / multipass) for the same encoder.
+    // May be null (e.g., enc_id empty); helpers handle null gracefully.
+    obs_properties_t* props =
+        enc_id.empty() ? nullptr : obs_get_encoder_properties(enc_id.c_str());
 
     // ---- Repopulate combos ----
 
@@ -1026,7 +919,9 @@ void SlotEditor::update_encoder_specific_ui(obs_properties_t* ext_props)
                              is_nvenc && multipass_combo_->count() > 0);
     }
 
-    if (own_props && props) obs_properties_destroy(props);
+    // F-USE1: destroy the hoisted properties object exactly once after all
+    // combo populations are done. Safe to call on null.
+    if (props) obs_properties_destroy(props);
 
     // ---- Main form visibility ----
 
@@ -1089,76 +984,13 @@ void SlotEditor::update_encoder_specific_ui(obs_properties_t* ext_props)
     set_form_row_visible(adv_form_, av1_tile_rows_spin_,  is_av1);
 }
 
-void SlotEditor::on_replay_max_size_inputs_changed()
-{
-    SceneSlot::Config preview;
-    preview.width = (uint32_t)(w_spin_->value() & ~1u);
-    preview.height = (uint32_t)(h_spin_->value() & ~1u);
-    if (preview.width  < 64) preview.width  = 64;
-    if (preview.height < 64) preview.height = 64;
-    preview.fps_num = (uint32_t)fps_num_spin_->value();
-    preview.fps_den = (uint32_t)fps_den_spin_->value();
-    if (preview.fps_den == 0) preview.fps_den = 1;
-    preview.rate_control = rc_combo_->currentData().toString().toStdString();
-    if (preview.rate_control.empty()) preview.rate_control = "CBR";
-    preview.rc_value = (uint32_t)rc_value_spin_->value();
-    preview.audio_bitrate = (uint32_t)abitrate_spin_->value();
-    preview.audio_tracks = 0;
-    for (int i = 0; i < 6; ++i)
-        if (track_checks_[i] && track_checks_[i]->isChecked())
-            preview.audio_tracks |= (1u << i);
-    if (preview.audio_tracks == 0) preview.audio_tracks = 0x01;
-    preview.replay_enabled = replay_check_->isChecked();
-    preview.replay_seconds = (uint32_t)replay_secs_->value();
-    preview.replay_max_size_mb = (uint32_t)replay_max_size_spin_->value();
-    preview.shared_encoder_slot_id = cfg_.shared_encoder_slot_id;
-
-    EffectiveRC eff;
-    if (!preview.shared_encoder_slot_id.empty())
-        eff = SlotManager::instance().effective_rate_control(preview);
-    else
-        eff = {preview.rate_control, preview.rc_value, false, ""};
-
-    uint64_t auto_mb = replay_buffer_util::auto_derived_max_size_mb(preview, eff);
-    uint64_t requested_mb = (preview.replay_max_size_mb > 0)
-        ? preview.replay_max_size_mb : auto_mb;
-    uint64_t avail_mb = cached_avail_mb_;
-    bool was_clamped = false;
-    uint64_t resolved;
-    if (avail_mb > 0 && requested_mb > avail_mb / 2) {
-        resolved = avail_mb / 2;
-        was_clamped = true;
-    } else {
-        resolved = requested_mb;
-    }
-    if (resolved < 50)
-        resolved = 0;
-
-    if (resolved == 0) {
-        replay_max_size_label_->setText(
-            QString("(would be declined \xe2\x80\x94 host RAM too low)"));
-        replay_max_size_label_->setStyleSheet("color: rgb(220, 140, 60);");
-    } else if (preview.replay_max_size_mb > 0) {
-        replay_max_size_label_->setText(
-            QString("(set: %1 MB \xe2\x80\x94 auto would be %2 MB)")
-                .arg(resolved).arg(auto_mb));
-        replay_max_size_label_->setStyleSheet("");
-    } else {
-        replay_max_size_label_->setText(
-            QString("(auto: %1 MB)").arg(resolved));
-        replay_max_size_label_->setStyleSheet("");
-    }
-}
-
 void SlotEditor::update_shared_encoder_visibility()
 {
     const QString data = venc_combo_->currentData().toString();
     const bool is_shared = data.startsWith("shared:");
 
-    // When shared: hide all video pipeline settings EXCEPT rate-control rows.
-    // FR-005: rate-control rows stay visible for consumers, rendered read-only
-    // and labeled with the owner's name so the user knows where the settings
-    // come from (information gained, no control lost).
+    // When shared: hide all video pipeline settings.
+    // These rows are irrelevant because the dependent creates no view/video/encoder.
 
     // Resolution row
     set_form_row_visible(form_, w_spin_->parentWidget(), !is_shared);
@@ -1167,63 +999,9 @@ void SlotEditor::update_shared_encoder_visibility()
     // Scene (dependent has no view, scene is meaningless)
     set_form_row_visible(form_, scene_combo_, !is_shared);
 
-    // Rate control + value: keep visible; render read-only inherited content
-    // when is_shared, restore editable state otherwise.
-    set_form_row_visible(form_, rc_combo_, true);
-    set_form_row_visible(form_, rc_value_spin_, true);
-    if (is_shared) {
-        auto eff = SlotManager::instance().effective_rate_control(cfg_);
-
-        // Label shape (canonical strings — see contracts/rate-control-coherence.md):
-        //   normal (owner resolved): "(inherited from <name>)"
-        //   orphan  (owner missing): "(inherited — owner missing)"
-        //   fallback active        : append " [CBR fallback]"
-        QString suffix;
-        if (!eff.owner_slot_name.empty())
-            suffix = QString(" (inherited from %1)")
-                         .arg(QString::fromStdString(eff.owner_slot_name));
-        else
-            suffix = QString(" (inherited — owner missing)");
-        if (eff.fallback)
-            suffix += " [CBR fallback]";
-
-        // Rate-control combo: single disabled item showing the owner's mode.
-        loading_ = true;
-        rc_combo_->clear();
-        rc_combo_->addItem(QString::fromStdString(eff.mode),
-                           QString::fromStdString(eff.mode));
-        rc_combo_->setCurrentIndex(0);
-        rc_combo_->setEnabled(false);
-        loading_ = false;
-        if (auto* lbl = qobject_cast<QLabel*>(form_->labelForField(rc_combo_)))
-            lbl->setText(tr("Rate control") + suffix);
-
-        // Value spinbox: [V,V] read-only, or 0+specialValueText for Lossless.
-        if (rc_util::is_lossless(eff.mode)) {
-            rc_value_spin_->setSpecialValueText(tr("— (lossless)"));
-            rc_value_spin_->setRange(0, 0);
-            rc_value_spin_->setValue(0);
-        } else {
-            rc_value_spin_->setSpecialValueText("");
-            rc_value_spin_->setRange((int)eff.value, (int)eff.value);
-            rc_value_spin_->setValue((int)eff.value);
-        }
-        rc_value_spin_->setEnabled(false);
-        if (rc_value_label_) rc_value_label_->setText(tr("Value") + suffix);
-    } else {
-        // Standalone slot: re-enable widgets and restore plain row labels.
-        // populate_rate_control_combo + update_rc_value_field have already
-        // re-populated the rows for the newly-selected encoder (via the
-        // !is_shared branch of on_encoder_changed, or via the ctor's initial
-        // pass for a slot opened as standalone), so the combo content is
-        // already correct here.
-        rc_combo_->setEnabled(true);
-        rc_value_spin_->setEnabled(true);
-        if (auto* lbl = qobject_cast<QLabel*>(form_->labelForField(rc_combo_)))
-            lbl->setText(tr("Rate control"));
-        // rc_value_label_'s text is restored by update_rc_value_field to the
-        // mode-appropriate "Bitrate" / "Quality (lower = better)".
-    }
+    // Rate control + value
+    set_form_row_visible(form_, rc_combo_, !is_shared);
+    set_form_row_visible(form_, rc_value_spin_, !is_shared);
 
     // All video encoder settings
     set_form_row_visible(form_, keyframe_sec_spin_, !is_shared);
