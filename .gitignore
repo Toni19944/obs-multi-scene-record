@@ -9,7 +9,6 @@
 !/src
 !.clang-format
 !.gersemirc
-!.gitattributes
 !.gitignore
 !buildspec.json
 !CMakeLists.txt
@@ -17,8 +16,10 @@
 !LICENSE
 !README.md
 !CHANGELOG.md
-!BUILD.md
-!preview.png
+!/.specify
+
+# Exclude lock files
+*.lock.json
 
 # Exclude macOS legacy resource forks
 .DS_Store
