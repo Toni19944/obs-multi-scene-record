@@ -17,6 +17,10 @@
 !README.md
 !CHANGELOG.md
 !/.specify
+!/specs
+
+# Keep per-feature test results as gitignored institutional memory
+specs/**/results/
 
 # Exclude lock files
 *.lock.json
