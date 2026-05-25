@@ -38,6 +38,14 @@ following section headings as applicable:
   user-visible behaviour change).
 - Align each slot's `obs_video_info` to the OBS main `ovi` to prevent
   resolution/framerate drift between slots and the main canvas (D2/D3/D4).
+- Replay-save log line wording: the proc-dispatch site now emits
+  `replay save requested` (INFO) on dispatch and
+  `replay save proc-dispatch FAILED (slot not capturing?)` (WARNING) on
+  dispatch failure. A new line, `replay save wrote '<path>'` (INFO), is
+  emitted from the OBS replay-buffer `saved` signal callback only after a
+  successful on-disk write. A `requested` line with no matching `wrote`
+  follow-up is now the explicit failure signal
+  (`007-fix-replay-collision`).
 
 ### Fixed
 
@@ -52,5 +60,13 @@ following section headings as applicable:
   substitutes unknown rate-control modes against the encoder's introspected
   lists, emitting a single warning per affected slot
   (`006-cqp-mismatch`).
+- Replay-buffer filename collision across slots sharing an output
+  directory: two or more slots writing into the same directory with the
+  same container no longer silently lose files when Save Replay fires on
+  each within the same wall-clock second. The replay filename now embeds
+  the sanitized slot name and a 6-hex-char per-slot identity prefix
+  (shape `<name>_<id6>_Replay_<ts>.<ext>`), making cross-slot collision
+  impossible by construction and giving the user per-file attribution
+  from the filename alone (`007-fix-replay-collision`).
 
 [Unreleased]: https://github.com/Toni19944/obs-multi-scene-record

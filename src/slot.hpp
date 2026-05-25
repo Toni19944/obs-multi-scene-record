@@ -232,7 +232,19 @@ public:
     static void on_rec_output_stop(void* data, calldata_t* cd);
     static void on_replay_output_stop(void* data, calldata_t* cd);
 
+    // Replay-buffer "saved" signal handler. Fired by libobs from the mux
+    // worker thread only after a successful on-disk write (per
+    // obs-ffmpeg-mux.c:1130-1134). Takes NO plugin locks; the
+    // signal_handler_disconnect in teardown_locked is the synchronization
+    // barrier.
+    static void on_replay_saved(void* data, calldata_t* cd);
+
 private:
+    // Instance helper called by on_replay_saved. Emits the truthful
+    // "wrote '<path>'" log line using the path from the replay output's
+    // get_last_replay proc. NO plugin locks.
+    void log_replay_saved();
+
     bool setup_encoders();
     // Resolved rate-control passed in by start() before taking slot_mtx_, so
     // the replay-buffer memory-cap estimate uses the OWNER's effective values
@@ -312,6 +324,28 @@ private:
     uint64_t   last_sample_bytes_    = 0;
     double     last_kbps_            = 0.0;
 };
+
+// --- replay filename helpers -------------------------------------------------
+//
+// Declared after class SceneSlot because build_replay_format reads SceneSlot::Config
+// (a nested type that cannot be forward-declared from outside the enclosing class).
+// Both functions are pure: no globals, no logging, no plugin locks acquired.
+
+namespace replay_util {
+
+// Replace path-unsafe characters in `name` with `_`, collapse `_` runs,
+// strip leading/trailing `{_, ., space}`, and prepend `_` if the result
+// matches a Windows reserved device name. See specs/007-fix-replay-collision
+// data-model.md § Sanitization rule for the exact character set.
+std::string sanitize_for_filename(const std::string &name);
+
+// Build the OBS replay-buffer "format" setting:
+//   "<NAME>_<ID6>_Replay_%CCYY-%MM-%DD_%hh-%mm-%ss"
+// <NAME> = sanitize_for_filename(cfg.name), or "slot" when empty.
+// <ID6>  = last 6 hex chars of cfg.id (whole id if shorter than 6).
+std::string build_replay_format(const SceneSlot::Config &cfg);
+
+} // namespace replay_util
 
 // --- rate control helpers (shared with the UI editor) ------------------------
 

@@ -9,6 +9,7 @@
 
 #include <QMetaObject>
 
+#include <cctype>
 #include <cstdio>
 #include <ctime>
 
@@ -53,6 +54,98 @@ const char *const *quality_split_keys()
 }
 
 } // namespace rc_util
+
+// =============================================================================
+// replay filename helpers
+// =============================================================================
+
+namespace replay_util {
+
+std::string sanitize_for_filename(const std::string &name)
+{
+	std::string out;
+	out.reserve(name.size());
+
+	auto is_illegal = [](unsigned char c) -> bool {
+		if (c <= 0x1F || c == 0x7F)
+			return true;
+		switch (c) {
+		case '<': case '>': case ':': case '"':
+		case '/': case '\\': case '|': case '?': case '*':
+		case '%':
+			return true;
+		default:
+			return false;
+		}
+	};
+
+	// Replace illegal chars with '_' and collapse runs of '_'.
+	for (char ch : name) {
+		char repl = is_illegal((unsigned char)ch) ? '_' : ch;
+		if (repl == '_' && !out.empty() && out.back() == '_')
+			continue;
+		out.push_back(repl);
+	}
+
+	// Strip leading {_, ., space}.
+	size_t start = 0;
+	while (start < out.size() && (out[start] == '_' || out[start] == '.' || out[start] == ' '))
+		++start;
+	// Strip trailing {_, ., space}.
+	size_t end = out.size();
+	while (end > start && (out[end - 1] == '_' || out[end - 1] == '.' || out[end - 1] == ' '))
+		--end;
+	out = out.substr(start, end - start);
+
+	// Windows reserved device names: prepend '_' if case-folded match.
+	if (!out.empty()) {
+		std::string upper;
+		upper.reserve(out.size());
+		for (char ch : out)
+			upper.push_back((char)std::toupper((unsigned char)ch));
+
+		static const char *reserved_exact[] = {"CON", "PRN", "AUX", "NUL", nullptr};
+		bool match = false;
+		for (const char **r = reserved_exact; *r; ++r) {
+			if (upper == *r) {
+				match = true;
+				break;
+			}
+		}
+		if (!match && upper.size() == 4 &&
+		    (upper.compare(0, 3, "COM") == 0 || upper.compare(0, 3, "LPT") == 0) &&
+		    upper[3] >= '1' && upper[3] <= '9') {
+			match = true;
+		}
+		if (match)
+			out.insert(out.begin(), '_');
+	}
+
+	return out;
+}
+
+std::string build_replay_format(const SceneSlot::Config &cfg)
+{
+	std::string name = sanitize_for_filename(cfg.name);
+	if (name.empty())
+		name = "slot";
+
+	std::string id6;
+	if (cfg.id.size() >= 6)
+		id6 = cfg.id.substr(cfg.id.size() - 6);
+	else
+		id6 = cfg.id;
+
+	std::string out;
+	out.reserve(name.size() + 1 + id6.size() + 40);
+	out += name;
+	out += '_';
+	out += id6;
+	out += "_Replay_%CCYY-%MM-%DD_%hh-%mm-%ss";
+	return out;
+}
+
+} // namespace replay_util
 
 // =============================================================================
 // helpers
@@ -664,6 +757,14 @@ void SceneSlot::teardown_locked()
 		obs_output_stop(rec_out_);
 	}
 	if (replay_out_) {
+		// Disconnect "saved" BEFORE "stop" so the mux-thread callback
+		// cannot fire after this thread proceeds to release the output.
+		// libobs's signal_handler_disconnect blocks on any in-flight
+		// dispatch (signal.c serializes dispatch/disconnect on the
+		// signal's internal mutex), so after this call returns
+		// on_replay_saved is guaranteed not running.
+		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "saved",
+					  &SceneSlot::on_replay_saved, this);
 		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "stop",
 					  &SceneSlot::on_replay_output_stop, this);
 		obs_output_stop(replay_out_);
@@ -798,7 +899,7 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 
 		obs_data_t *rb = obs_data_create();
 		obs_data_set_string(rb, "directory", cfg_.path.c_str());
-		obs_data_set_string(rb, "format", "Replay_%CCYY-%MM-%DD_%hh-%mm-%ss");
+		obs_data_set_string(rb, "format", replay_util::build_replay_format(cfg_).c_str());
 		obs_data_set_string(rb, "extension", cfg_.container.empty() ? "mp4" : cfg_.container.c_str());
 		obs_data_set_int(rb, "max_time_sec", cfg_.replay_seconds);
 		uint64_t max_size_mb = (uint64_t)est_kbps * cfg_.replay_seconds / 8 / 1024 * 3 / 2;
@@ -820,6 +921,10 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 			// Detect external/error stops on the replay output too.
 			signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
 					       &SceneSlot::on_replay_output_stop, this);
+			// Truthful save-result audit: "saved" fires from the mux thread
+			// only after a successful on-disk write.
+			signal_handler_connect(obs_output_get_signal_handler(replay_out_), "saved",
+					       &SceneSlot::on_replay_saved, this);
 
 			if (cfg_.container == "mp4" || cfg_.container == "MP4") {
 				blog(LOG_WARNING,
@@ -1041,6 +1146,43 @@ void SceneSlot::on_replay_output_stop(void *data, calldata_t *cd)
 		QMetaObject::invokeMethod(dock, "refresh", Qt::QueuedConnection);
 }
 
+// Runs on the OBS mux worker thread. Takes NO plugin locks (matching
+// on_replay_output_stop). The signal_handler_disconnect in teardown_locked
+// blocks on in-flight dispatch, so replay_out_ cannot be released while
+// this callback is executing.
+void SceneSlot::on_replay_saved(void *data, calldata_t * /*cd*/)
+{
+	auto *self = static_cast<SceneSlot *>(data);
+	if (!self)
+		return;
+	self->log_replay_saved();
+}
+
+// NO plugin locks. Reads cfg_.name and replay_out_ lock-free (same convention
+// as on_replay_output_stop at slot.cpp above). Calls get_last_replay on the
+// replay-buffer output's proc handler; the precondition (muxing == false) is
+// satisfied because the "saved" signal fires only after the mux thread sets
+// muxing = false (obs-ffmpeg-mux.c:1128 before :1133).
+void SceneSlot::log_replay_saved()
+{
+	if (!replay_out_) {
+		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", cfg_.name.c_str());
+		return;
+	}
+	proc_handler_t *ph = obs_output_get_proc_handler(replay_out_);
+	if (!ph) {
+		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", cfg_.name.c_str());
+		return;
+	}
+	calldata_t cd;
+	calldata_init(&cd);
+	proc_handler_call(ph, "get_last_replay", &cd);
+	const char *path = calldata_string(&cd, "path");
+	blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '%s'", cfg_.name.c_str(),
+	     (path && *path) ? path : "<unknown>");
+	calldata_free(&cd);
+}
+
 void SceneSlot::on_save_hotkey(void *data, obs_hotkey_id /*id*/, obs_hotkey_t * /*hk*/, bool pressed)
 {
 	if (!pressed)
@@ -1063,7 +1205,16 @@ bool SceneSlot::save_replay()
 	calldata_init(&cd);
 	bool ok = proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
-	blog(LOG_INFO, "[multi-scene-rec] '%s' replay save %s", cfg_.name.c_str(), ok ? "OK" : "FAILED");
+	if (ok) {
+		// Neutral wording: the proc dispatched, but the on-disk write
+		// happens asynchronously on the OBS mux thread. The truthful
+		// success line ("replay save wrote '<path>'") is emitted from
+		// on_replay_saved only after the mux thread confirms the write.
+		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save requested", cfg_.name.c_str());
+	} else {
+		blog(LOG_WARNING, "[multi-scene-rec] '%s' replay save proc-dispatch FAILED (slot not capturing?)",
+		     cfg_.name.c_str());
+	}
 	return ok;
 }
 
