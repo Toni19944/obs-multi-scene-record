@@ -184,6 +184,41 @@ bool SlotManager::config_by_slot_id(const std::string& slot_id,
     return false;
 }
 
+EffectiveRC SlotManager::effective_rate_control(const SceneSlot::Config& c) const
+{
+    // (a) Owner slot: pass through its own fields.
+    if (c.shared_encoder_slot_id.empty())
+        return {c.rate_control, c.rc_value, false, ""};
+
+    // (b) Consumer: resolve owner Config via existing path (takes mtx_ briefly
+    //     and releases before we touch shared_mtx_). On lookup failure (e.g.
+    //     orphan consumer: owner deleted while consumer survives) return safe
+    //     last-resort values matching slot_from_data's CBR/6000 defaults. The
+    //     empty owner_slot_name signals the orphan case to the editor for the
+    //     "(inherited — owner missing)" label shape.
+    SceneSlot::Config owner;
+    if (!config_by_slot_id(c.shared_encoder_slot_id, owner))
+        return {"CBR", 6000, false, ""};
+
+    EffectiveRC eff{owner.rate_control, owner.rc_value, false, owner.name};
+
+    // (c) Overlay fallback ONLY when a SharedEncoder row exists for this
+    //     group and was built under the obs_x264/CBR fallback path. Takes
+    //     leaf shared_mtx_ briefly, never nested with mtx_ above.
+    {
+        std::lock_guard<std::mutex> slk(shared_mtx_);
+        auto it = shared_.find(c.shared_encoder_slot_id);
+        if (it != shared_.end() && it->second && it->second->encoder_fallback_) {
+            eff.mode = "CBR";
+            eff.value = rc_util::is_bitrate_based(owner.rate_control)
+                            ? owner.rc_value
+                            : 6000;
+            eff.fallback = true;
+        }
+    }
+    return eff;
+}
+
 // ----------------------------------------------------------------------------
 // shared-encoder registry
 //
@@ -375,6 +410,91 @@ static SceneSlot::Config slot_from_data(obs_data_t* d)
     if (c.audio_bitrate == 0) c.audio_bitrate = 160;
     if (c.replay_seconds == 0) c.replay_seconds = 30;
 
+    // Feature 006 — consumer-side normalization (Decision 2) and standalone
+    // load-time validation (Decisions 3 and 4). Explicit if/else branching
+    // keeps the consumer-only and standalone-only paths unambiguous.
+    if (!c.shared_encoder_slot_id.empty()) {
+        // T010 / FR-006 / FR-012 — consumer slots must never carry standalone
+        // rate-control values. The sentinel + 0 are what every read site
+        // (editor, log, replay-buffer estimate) recognises as "ask the helper
+        // for the owner's effective values". The orphan-consumer warning
+        // (T010b) runs in load_from's post-pass for the subset whose
+        // shared_encoder_slot_id reference does not resolve.
+        c.rate_control = "<inherited>";
+        c.rc_value     = 0;
+    } else {
+        // Standalone slot: introspect the selected encoder once and validate
+        // the persisted mode + value. Same property-accessor pattern the
+        // editor uses, so the editor's range source and the load-time clamp
+        // source agree by construction.
+        obs_properties_t* props =
+            c.video_encoder_id.empty()
+                ? nullptr
+                : obs_get_encoder_properties(c.video_encoder_id.c_str());
+        if (props) {
+            // T011 / Decision 4 / FR-015 — mode-substitute-and-warn.
+            obs_property_t* rc_prop = obs_properties_get(props, "rate_control");
+            if (rc_prop && obs_property_get_type(rc_prop) == OBS_PROPERTY_LIST) {
+                size_t count = obs_property_list_item_count(rc_prop);
+                bool in_list = false;
+                std::string first_mode;
+                for (size_t i = 0; i < count; ++i) {
+                    const char* val = obs_property_list_item_string(rc_prop, i);
+                    if (!val || !*val) continue;
+                    if (first_mode.empty()) first_mode = val;
+                    if (c.rate_control == val) { in_list = true; break; }
+                }
+                if (!in_list && !first_mode.empty()) {
+                    std::string original_rc = c.rate_control;
+                    c.rate_control = first_mode;
+                    blog(LOG_WARNING,
+                         "[multi-scene-rec] '%s': rate-control '%s' not supported by %s; substituted '%s'",
+                         c.name.c_str(), original_rc.c_str(),
+                         c.video_encoder_id.c_str(), c.rate_control.c_str());
+                }
+            }
+
+            // T012 / Decision 3 / FR-013 — value-clamp-and-warn against the
+            // (possibly substituted) mode. Bitrate-based modes use "bitrate";
+            // quality-based modes walk rc_util::quality_keys() then
+            // quality_split_keys() (first match wins) — same order as
+            // set_quality_value's write site so the introspected range and
+            // the write target are derived from the same list.
+            if (!rc_util::is_lossless(c.rate_control)) {
+                obs_property_t* range_p = nullptr;
+                if (rc_util::is_bitrate_based(c.rate_control)) {
+                    range_p = obs_properties_get(props, "bitrate");
+                } else {
+                    for (const char* const* k = rc_util::quality_keys(); *k; ++k) {
+                        obs_property_t* p = obs_properties_get(props, *k);
+                        if (p) { range_p = p; break; }
+                    }
+                    if (!range_p) {
+                        for (const char* const* k = rc_util::quality_split_keys(); *k; ++k) {
+                            obs_property_t* p = obs_properties_get(props, *k);
+                            if (p) { range_p = p; break; }
+                        }
+                    }
+                }
+                if (range_p && obs_property_get_type(range_p) == OBS_PROPERTY_INT) {
+                    int rmin = obs_property_int_min(range_p);
+                    int rmax = obs_property_int_max(range_p);
+                    if ((int)c.rc_value < rmin || (int)c.rc_value > rmax) {
+                        uint32_t original_value = c.rc_value;
+                        c.rc_value = (int)c.rc_value < rmin
+                                         ? (uint32_t)rmin
+                                         : (uint32_t)rmax;
+                        blog(LOG_WARNING,
+                             "[multi-scene-rec] '%s': rc value %u out of range for %s on %s [%d, %d]; clamped to %u",
+                             c.name.c_str(), original_value, c.rate_control.c_str(),
+                             c.video_encoder_id.c_str(), rmin, rmax, c.rc_value);
+                    }
+                }
+            }
+            obs_properties_destroy(props);
+        }
+    }
+
     // ---- New encoder settings (absent in old saves) ----
 
     // keyframe_interval_sec: 0 if absent → use former hardcoded default 2.
@@ -497,6 +617,34 @@ void SlotManager::load_from(obs_data_t* save_data)
             slots_.back()->set_pending_hotkey_bindings(hkr, hkp);
             obs_data_release(d);
         }
+
+        // T010b — orphan-consumer warning: any consumer whose
+        // shared_encoder_slot_id does NOT resolve to a sibling owner is left
+        // as an orphan. effective_rate_control returns safe last-resort
+        // values for orphans and the editor displays "(inherited — owner
+        // missing)" so the dangling reference is surfaced without crashing.
+        // This second pass runs while still holding mtx_, so we iterate
+        // slots_ directly rather than calling config_by_slot_id (which would
+        // re-take mtx_).
+        for (auto& consumer : slots_) {
+            const auto& cc = consumer->config();
+            if (cc.shared_encoder_slot_id.empty()) continue;
+            bool resolved = false;
+            for (auto& owner_s : slots_) {
+                if (owner_s->config().id == cc.shared_encoder_slot_id) {
+                    resolved = true;
+                    break;
+                }
+            }
+            if (!resolved) {
+                blog(LOG_WARNING,
+                     "[multi-scene-rec] '%s': shared_encoder_slot_id '%s' does not resolve "
+                     "— orphan consumer; reads will return safe last-resort values until "
+                     "the user re-points the slot or deletes it",
+                     cc.name.c_str(), cc.shared_encoder_slot_id.c_str());
+            }
+        }
+
         // slots_ was rebuilt: invalidate any cached raw SceneSlot* held by
         // the UI (see SlotManager::generation() / refresh_stats()).
         ++generation_;

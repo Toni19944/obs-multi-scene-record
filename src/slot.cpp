@@ -33,6 +33,25 @@ bool is_lossless(const std::string &mode)
 	return mode == "Lossless" || mode == "LOSSLESS" || mode == "lossless";
 }
 
+// Canonical match order — first present key wins for both editor range
+// introspection and the encoder-build write target.
+static constexpr const char *kQualityKeys[] = {"crf",          "cqp", "cq_level", "qp",
+					       "icq_quality", "global_quality", nullptr};
+
+// QSV split keys (CQP on QSV uses qpi/qpp/qpb as a unit). Walked only after
+// kQualityKeys yielded no match.
+static constexpr const char *kQualitySplitKeys[] = {"qpi", "qpp", "qpb", nullptr};
+
+const char *const *quality_keys()
+{
+	return kQualityKeys;
+}
+
+const char *const *quality_split_keys()
+{
+	return kQualitySplitKeys;
+}
+
 } // namespace rc_util
 
 // =============================================================================
@@ -95,20 +114,22 @@ static void set_quality_value(obs_data_t *settings, const char *enc_id, int valu
 		obs_data_set_int(settings, "cqp", value);
 		return;
 	}
-	const char *single_keys[] = {"crf", "cqp", "cq_level", "qp", "icq_quality", "global_quality"};
-	for (const char *k : single_keys) {
-		if (obs_properties_get(props, k)) {
-			obs_data_set_int(settings, k, value);
+	// First present key from the canonical list wins. The editor's range
+	// introspection (introspect_quality_range in ui-slot-editor.cpp) walks
+	// the same list — adding a key to one side without the other becomes a
+	// compile-time follow-through to rc_util::quality_keys().
+	for (const char *const *k = rc_util::quality_keys(); *k; ++k) {
+		if (obs_properties_get(props, *k)) {
+			obs_data_set_int(settings, *k, value);
 			obs_properties_destroy(props);
-			return; // set only the first match
+			return;
 		}
 	}
-	// QSV split keys: set all three if present (they work as a unit)
-	const char *split_keys[] = {"qpi", "qpp", "qpb"};
+	// QSV split keys: set every present split key as a unit.
 	bool any_split = false;
-	for (const char *k : split_keys)
-		if (obs_properties_get(props, k)) {
-			obs_data_set_int(settings, k, value);
+	for (const char *const *k = rc_util::quality_split_keys(); *k; ++k)
+		if (obs_properties_get(props, *k)) {
+			obs_data_set_int(settings, *k, value);
 			any_split = true;
 		}
 	if (!any_split)
@@ -465,6 +486,12 @@ bool SceneSlot::start()
 		return false;
 	}
 
+	// Resolve effective rate-control BEFORE taking slot_mtx_. The helper
+	// internally takes mtx_ then shared_mtx_ (independently), so calling it
+	// while holding slot_mtx_ would invert the global order mtx_ ->
+	// slot_mtx_. Stash for the log emit and pass to setup_outputs (T006/T007).
+	const EffectiveRC eff_rc = SlotManager::instance().effective_rate_control(cfg_);
+
 	// slot_mtx_ guards all per-slot members written below (outputs, audio
 	// encoders, group_key_/venc_, cfg_). Held for the rest of start(). The
 	// atomic CAS above remains the fast early-out.
@@ -519,7 +546,7 @@ bool SceneSlot::start()
 		return false;
 	}
 
-	if (!setup_outputs()) {
+	if (!setup_outputs(eff_rc)) {
 		running_.store(false);
 		teardown_locked();
 		return false;
@@ -559,11 +586,24 @@ bool SceneSlot::start()
 		if (cfg_.audio_tracks & (1u << i))
 			pos += std::snprintf(tracks_str + pos, sizeof(tracks_str) - pos, "%s%d", pos ? "," : "", i + 1);
 
-	blog(LOG_INFO, "[multi-scene-rec] '%s' started (%ux%u@%u, %s/%u, tracks=%s, %s)", cfg_.name.c_str(), cfg_.width,
-	     cfg_.height, cfg_.fps_num, cfg_.rate_control.c_str(), cfg_.rc_value, tracks_str,
+	// Rate-control segment: Lossless prints no numeric value; bitrate/quality
+	// modes print "<mode>/<value>". A [CBR fallback] prefix surfaces the
+	// owner's encoder construction having fallen back to obs_x264/CBR.
+	char rc_buf[96];
+	if (rc_util::is_lossless(eff_rc.mode))
+		std::snprintf(rc_buf, sizeof(rc_buf), "%sLossless", eff_rc.fallback ? "[CBR fallback] " : "");
+	else
+		std::snprintf(rc_buf, sizeof(rc_buf), "%s%s/%u", eff_rc.fallback ? "[CBR fallback] " : "",
+			      eff_rc.mode.c_str(), eff_rc.value);
+
+	const bool inherited = !eff_rc.owner_slot_name.empty();
+	blog(LOG_INFO, "[multi-scene-rec] '%s' started (%ux%u@%u, %s, tracks=%s, %s)%s%s%s", cfg_.name.c_str(),
+	     cfg_.width, cfg_.height, cfg_.fps_num, rc_buf, tracks_str,
 	     cfg_.replay_only      ? "replay-only"
 	     : cfg_.replay_enabled ? "rec+replay"
-				   : "rec-only");
+				   : "rec-only",
+	     inherited ? " inherited from '" : "", inherited ? eff_rc.owner_slot_name.c_str() : "",
+	     inherited ? "'" : "");
 	return true;
 }
 
@@ -714,7 +754,7 @@ bool SceneSlot::setup_encoders()
 // outputs
 // =============================================================================
 
-bool SceneSlot::setup_outputs()
+bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 {
 	// ---- recording (ffmpeg_muxer) -- skipped entirely in replay-only mode ----
 	if (!cfg_.replay_only) {
@@ -744,8 +784,10 @@ bool SceneSlot::setup_outputs()
 	// ---- replay buffer (optional) ----
 	if (cfg_.replay_enabled) {
 		// Size cap is a safety net. For quality-based rate control there is no
-		// bitrate figure, so assume a generous 12 Mbps for the estimate.
-		uint32_t est_kbps = rc_util::is_bitrate_based(cfg_.rate_control) ? cfg_.rc_value : 12000;
+		// bitrate figure, so assume a generous 12 Mbps for the estimate. For
+		// consumer slots `eff` reflects the OWNER's effective mode/value (route
+		// resolved before slot_mtx_ in start()).
+		uint32_t est_kbps = rc_util::is_bitrate_based(eff.mode) ? eff.value : 12000;
 		auto popcount = [](uint32_t v) -> uint32_t {
 			uint32_t c = 0;
 			for (; v; v >>= 1)

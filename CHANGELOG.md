@@ -45,5 +45,12 @@ following section headings as applicable:
   indicator reflects the actual slot state.
 - Remove a redundant `running_.store(true)` in `SceneSlot::start()` that
   could mask a true start failure under contention (F-S1).
+- Consumer slots now report the owner's effective rate-control mode and
+  value everywhere (editor, slot-start log line, replay-buffer memory-cap
+  estimate), with read-only inherited labels in the editor instead of the
+  rows being hidden; load-time validation clamps out-of-range values and
+  substitutes unknown rate-control modes against the encoder's introspected
+  lists, emitting a single warning per affected slot
+  (`006-cqp-mismatch`).
 
 [Unreleased]: https://github.com/Toni19944/obs-multi-scene-record

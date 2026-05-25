@@ -7,6 +7,12 @@
 #include <string>
 #include <vector>
 
+// Forward-declared so SceneSlot::setup_outputs can take it by const-ref. The
+// full definition lives in manager.hpp, which itself includes this header —
+// breaking the cycle with a forward declaration here keeps both directions
+// safe.
+struct EffectiveRC;
+
 // One independent recording + optional replay buffer.
 //
 // Video: the scene/view/video/encoder pipeline lives in a refcounted
@@ -228,7 +234,12 @@ public:
 
 private:
     bool setup_encoders();
-    bool setup_outputs();
+    // Resolved rate-control passed in by start() before taking slot_mtx_, so
+    // the replay-buffer memory-cap estimate uses the OWNER's effective values
+    // (consumer reads route through SlotManager::effective_rate_control). The
+    // helper takes mtx_ then shared_mtx_ independently; resolving before
+    // slot_mtx_ keeps the global order mtx_ -> slot_mtx_ -> shared_mtx_.
+    bool setup_outputs(const struct EffectiveRC& eff);
     // Public locking entry point: acquires slot_mtx_ then calls teardown_locked().
     void teardown();
     // Core teardown. Caller MUST already hold slot_mtx_ (e.g. start()'s
@@ -312,5 +323,18 @@ bool is_bitrate_based(const std::string& mode);
 
 // True if `mode` takes no numeric value at all.
 bool is_lossless(const std::string& mode);
+
+// Canonical, null-terminated list of single-key encoder property names that
+// carry a quality-mode value (CRF / CQP / CQ / ICQ / Global Quality). The
+// FIRST present key wins for both editor range introspection
+// (introspect_quality_range) and the encoder-build write target
+// (set_quality_value) — both call sites walk this list, so any future PR that
+// adds a key to one side without the other becomes a compile-time follow-
+// through to this single source.
+const char* const* quality_keys();
+
+// Null-terminated list of QSV "split" quality keys. Set as a unit when none of
+// quality_keys() matched but any of these do (matches set_quality_value).
+const char* const* quality_split_keys();
 
 } // namespace rc_util
