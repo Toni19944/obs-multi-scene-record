@@ -24,6 +24,11 @@ following section headings as applicable:
 
 ### Fixed
 
+- Remove dead `obs_output_set_mixers` calls on encoded outputs (`ffmpeg_muxer`
+  and `replay_buffer`) that produced an OBS warning on every slot start.
+  Audio track routing is unaffected — it was already fully handled by
+  `obs_output_set_audio_encoder` (`009-remove-dead-mixer-call`).
+
 - Replay buffer no longer truncates to inconsistent short durations when
   the rate-control mode is quality-based (CQP / CRF / CQ / ICQ / QVBR /
   Lossless). The buffer's memory ceiling now scales with resolution x fps x

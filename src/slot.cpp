@@ -980,7 +980,6 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 		// non-contiguous track selections route to the wrong/empty tracks.
 		for (size_t i = 0; i < aencs_.size(); ++i)
 			obs_output_set_audio_encoder(rec_out_, aencs_[i], (size_t)selected_tracks_[i]);
-		obs_output_set_mixers(rec_out_, cfg_.audio_tracks);
 
 		// Detect external/error stops (disk full, encoder failure, ...).
 		signal_handler_connect(obs_output_get_signal_handler(rec_out_), "stop", &SceneSlot::on_rec_output_stop,
@@ -1069,7 +1068,6 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 				obs_output_set_video_encoder(replay_out_, venc_);
 				for (size_t i = 0; i < aencs_.size(); ++i)
 					obs_output_set_audio_encoder(replay_out_, aencs_[i], (size_t)selected_tracks_[i]);
-				obs_output_set_mixers(replay_out_, cfg_.audio_tracks);
 
 				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
 						       &SceneSlot::on_replay_output_stop, this);
