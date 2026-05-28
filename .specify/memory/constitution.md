@@ -1,11 +1,15 @@
 <!--
 Sync Impact Report
 ==================
-Version change: 1.1.0 → 1.2.0
-Modified principles: None (all principles I–IX retained verbatim)
-Added sections:
-  - Development Workflow: new bullet "Patch notes" requiring a CHANGELOG-style
-    Markdown file at repo root, with an entry per feature and per bug fix.
+Version change: 1.2.0 → 1.3.0
+Modified principles:
+  - VII. Recording & Replay Buffer Correctness (NON-NEGOTIABLE): added a
+    "Host-resource precondition" sub-section that scopes the principle's
+    MUSTs to the case where the host can allocate the required resources,
+    and admits feature-agnostic degraded operation under three conditions
+    (loud surfacing, slot-local confinement, non-silent at save time).
+    Silent degradation remains ship-blocking. No MUST removed.
+Added sections: None (sub-section added inside Principle VII)
 Removed sections: None
 Templates:
   - .specify/templates/plan-template.md  ✅ Constitution Check is generic; no change required
@@ -13,6 +17,10 @@ Templates:
   - .specify/templates/tasks-template.md ✅ No constitution-specific references; no change required
   - .specify/templates/commands/         ✅ No command files present
 Deferred TODOs: None
+
+Previous report (v1.1.0 → v1.2.0):
+  Added Development Workflow bullet "Patch notes" requiring a CHANGELOG-style
+  Markdown file at repo root, with an entry per feature and per bug fix.
 
 Previous report (v1.0.0 → v1.1.0):
   Added Core Principles VI–IX (Pipeline Isolation, Recording & Replay Buffer
@@ -126,10 +134,34 @@ its configured parameters:
 - Stopping one slot MUST NOT truncate, drop frames from, or otherwise
   corrupt any other slot's in-flight recording or buffered replay.
 
+**Host-resource precondition**: The MUSTs above assume the host can
+allocate the resources (RAM, disk bandwidth, GPU encode capacity, etc.)
+required by the slot's configured parameters. When a host-resource
+shortfall prevents honoring a configured parameter, the plugin MAY
+degrade the affected slot's behavior provided **all** of the following
+hold:
+
+1. The degradation is detected and surfaced loudly — a warning in the
+   plugin log (and, where a UI surface exists, in the UI) naming the
+   slot, the requested value, the value actually in effect, and at least
+   one actionable remedy the user can apply.
+2. The degradation is confined to the slot whose resources could not be
+   satisfied; sibling slots' configured parameters remain honored.
+3. The degradation is not silent at save/output time — any artifact
+   produced under degraded conditions (e.g., a replay save shorter than
+   configured) MUST be accompanied by log wording that identifies the
+   shortfall as the cause, not misattributed to a different failure.
+
+Silent corruption, silent truncation, and unobservable degradation
+remain ship-blocking defects. The MUSTs apply unconditionally when the
+host-resource precondition holds.
+
 **Rationale**: These are the plugin's headline features. Any regression
 here is a ship-blocking defect — a multi-scene recorder that drops frames
-when a sibling stops, or saves the wrong duration, has failed at its
-primary job.
+when a sibling stops, or saves the wrong duration without telling the
+user, has failed at its primary job. Host-resource exhaustion is a real
+boundary condition the plugin cannot eliminate; what the plugin CAN do is
+refuse to lie about it.
 
 ### VIII. Shared Encoder — Literal Semantics
 
@@ -245,4 +277,4 @@ cite Principle IX and document the migration in the release notes.
 
 **Runtime guidance**: See `CLAUDE.md` for agent-specific development guidance.
 
-**Version**: 1.2.0 | **Ratified**: 2026-05-19 | **Last Amended**: 2026-05-24
+**Version**: 1.3.0 | **Ratified**: 2026-05-19 | **Last Amended**: 2026-05-26

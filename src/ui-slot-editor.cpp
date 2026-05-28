@@ -391,6 +391,51 @@ SlotEditor::SlotEditor(QWidget* parent, SceneSlot::Config cfg)
     replay_secs_->setValue((int)cfg_.replay_seconds); replay_secs_->setSuffix(" s");
     form->addRow("Replay length", replay_secs_);
 
+    replay_max_size_spin_ = new QSpinBox;
+    replay_max_size_spin_->setRange(0, 65536);
+    replay_max_size_spin_->setSuffix(" MB");
+    replay_max_size_spin_->setSpecialValueText("Auto");
+    replay_max_size_spin_->setValue((int)cfg_.replay_max_size_mb);
+    replay_max_size_spin_->setToolTip(QString::fromUtf8(
+        "Memory ceiling for the replay buffer.\n\n"
+        "Empty / 0 (Auto): sized automatically from "
+        "resolution \xc3\x97 fps \xc3\x97 replay seconds \xc3\x97 2\xc3\x97 safety margin, "
+        "calibrated for typical high-quality settings "
+        "(around CQP-17 / CRF-18). The resolved value is shown "
+        "alongside this field.\n\n"
+        "Positive integer: overrides the auto-derived value verbatim. "
+        "Set higher if you use an extreme-quality setting "
+        "and see \"suspected memory cap\" warnings in the log; "
+        "set lower to cap RAM use at the cost of shorter saved clips."));
+    replay_max_size_label_ = new QLabel;
+    auto* mb_row = new QHBoxLayout;
+    mb_row->addWidget(replay_max_size_spin_);
+    mb_row->addWidget(replay_max_size_label_, 1);
+    auto* mb_row_wrap = new QWidget;
+    mb_row_wrap->setLayout(mb_row);
+    form->addRow("Max replay buffer size", mb_row_wrap);
+
+    {
+        auto refresh = [this]() { on_replay_max_size_inputs_changed(); };
+        connect(replay_max_size_spin_, QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(replay_secs_,          QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(w_spin_,               QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(h_spin_,               QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(fps_num_spin_,         QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(fps_den_spin_,         QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        connect(rc_combo_,             QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, refresh);
+        connect(rc_value_spin_,        QOverload<int>::of(&QSpinBox::valueChanged),
+                this, refresh);
+        refresh();
+    }
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     connect(buttons, &QDialogButtonBox::accepted, this, &SlotEditor::on_accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -821,6 +866,7 @@ void SlotEditor::on_accept()
     cfg_.replay_enabled = replay_check_->isChecked();
     cfg_.replay_only    = replay_only_check_->isChecked() && cfg_.replay_enabled;
     cfg_.replay_seconds = (uint32_t)replay_secs_->value();
+    cfg_.replay_max_size_mb = (uint32_t)replay_max_size_spin_->value();
 
     cfg_.audio_tracks = 0;
     for (int i = 0; i < 6; ++i)
@@ -1042,6 +1088,57 @@ void SlotEditor::update_encoder_specific_ui()
     set_form_row_visible(adv_form_, hevc_tier_combo_,     is_hevc);
     set_form_row_visible(adv_form_, av1_tile_cols_spin_,  is_av1);
     set_form_row_visible(adv_form_, av1_tile_rows_spin_,  is_av1);
+}
+
+void SlotEditor::on_replay_max_size_inputs_changed()
+{
+    SceneSlot::Config preview;
+    preview.width = (uint32_t)(w_spin_->value() & ~1u);
+    preview.height = (uint32_t)(h_spin_->value() & ~1u);
+    if (preview.width  < 64) preview.width  = 64;
+    if (preview.height < 64) preview.height = 64;
+    preview.fps_num = (uint32_t)fps_num_spin_->value();
+    preview.fps_den = (uint32_t)fps_den_spin_->value();
+    if (preview.fps_den == 0) preview.fps_den = 1;
+    preview.rate_control = rc_combo_->currentData().toString().toStdString();
+    if (preview.rate_control.empty()) preview.rate_control = "CBR";
+    preview.rc_value = (uint32_t)rc_value_spin_->value();
+    preview.audio_bitrate = (uint32_t)abitrate_spin_->value();
+    preview.audio_tracks = 0;
+    for (int i = 0; i < 6; ++i)
+        if (track_checks_[i] && track_checks_[i]->isChecked())
+            preview.audio_tracks |= (1u << i);
+    if (preview.audio_tracks == 0) preview.audio_tracks = 0x01;
+    preview.replay_seconds = (uint32_t)replay_secs_->value();
+    preview.replay_max_size_mb = (uint32_t)replay_max_size_spin_->value();
+    preview.shared_encoder_slot_id = cfg_.shared_encoder_slot_id;
+
+    EffectiveRC eff;
+    if (!preview.shared_encoder_slot_id.empty())
+        eff = SlotManager::instance().effective_rate_control(preview);
+    else
+        eff = {preview.rate_control, preview.rc_value, false, ""};
+
+    bool was_clamped = false;
+    uint64_t requested_mb = 0;
+    uint64_t resolved = replay_buffer_util::resolve_max_size_mb(
+        preview, eff, &was_clamped, &requested_mb);
+
+    if (resolved == 0) {
+        replay_max_size_label_->setText(
+            QString("(would be declined \xe2\x80\x94 host RAM too low)"));
+        replay_max_size_label_->setStyleSheet("color: rgb(220, 140, 60);");
+    } else if (preview.replay_max_size_mb > 0) {
+        uint64_t auto_mb = replay_buffer_util::auto_derived_max_size_mb(preview, eff);
+        replay_max_size_label_->setText(
+            QString("(set: %1 MB \xe2\x80\x94 auto would be %2 MB)")
+                .arg(resolved).arg(auto_mb));
+        replay_max_size_label_->setStyleSheet("");
+    } else {
+        replay_max_size_label_->setText(
+            QString("(auto: %1 MB)").arg(resolved));
+        replay_max_size_label_->setStyleSheet("");
+    }
 }
 
 void SlotEditor::update_shared_encoder_visibility()

@@ -67,6 +67,10 @@ public:
         bool replay_only = false;
         uint32_t replay_seconds = 30;
 
+        // FR-012: per-slot user override for the replay buffer's max_size_mb.
+        // 0 = auto-derived per replay_buffer_util::resolve_max_size_mb.
+        uint32_t replay_max_size_mb = 0;
+
         // ---- Video encoder: user-configurable ----
 
         // Keyframe interval in seconds. Replaces the hardcoded 2 in apply_family_presets.
@@ -273,6 +277,17 @@ private:
     Config cfg_;
     std::atomic<bool> running_{false};
 
+    // FR-011: wall-clock slot start time for uptime check in log_replay_saved.
+    std::atomic<uint64_t> start_time_ns_{0};
+    // FR-011/FR-014: snapshot of resolved replay-buffer ceiling from setup_outputs.
+    std::atomic<uint64_t> resolved_max_size_mb_{0};
+    // FR-011: whether the FR-006 clamp-and-warn fired at slot start.
+    std::atomic<bool> was_clamped_at_start_{false};
+    // FR-011: snapshot of cfg_.replay_seconds at slot start (lock-free read in save callback).
+    std::atomic<uint32_t> replay_seconds_at_start_{0};
+    // FR-014: snapshot of auto-derived bitrate assumption at slot start.
+    std::atomic<uint32_t> assumed_kbps_at_start_{0};
+
     // Local copy of the shared context's fallback flag, taken at start() so
     // stats() can surface "[CBR fallback]" for the owner AND every sharer
     // without touching the shared registry. Guarded by slot_mtx_.
@@ -323,6 +338,8 @@ private:
     uint64_t   last_sample_bytes_ns_ = 0;
     uint64_t   last_sample_bytes_    = 0;
     double     last_kbps_            = 0.0;
+    // FR-014: EWMA-smoothed observed kbps for save-time FR-011 inference.
+    double     observed_kbps_ewma_  = 0.0;
 };
 
 // --- replay filename helpers -------------------------------------------------
@@ -372,3 +389,22 @@ const char* const* quality_keys();
 const char* const* quality_split_keys();
 
 } // namespace rc_util
+
+// --- replay buffer sizing helpers -------------------------------------------
+
+namespace replay_buffer_util {
+
+// Per-mode combined video+audio bitrate estimate in kbps.
+uint64_t estimated_kbps(const SceneSlot::Config &cfg, const struct EffectiveRC &eff);
+
+// Auto-derived max_size_mb from estimated_kbps × replay_seconds × 2× margin.
+uint64_t auto_derived_max_size_mb(const SceneSlot::Config &cfg, const struct EffectiveRC &eff);
+
+// Host available physical RAM in MB (platform-specific). Returns 0 on failure.
+uint64_t available_physical_mb();
+
+// Entry point: returns the resolved cap (0 = decline replay buffer).
+uint64_t resolve_max_size_mb(const SceneSlot::Config &cfg, const struct EffectiveRC &eff,
+                             bool *out_was_clamped, uint64_t *out_requested_mb);
+
+} // namespace replay_buffer_util

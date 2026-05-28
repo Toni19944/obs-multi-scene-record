@@ -334,6 +334,7 @@ static obs_data_t* slot_to_data(const SceneSlot::Config& c)
     obs_data_set_bool(d, "replay_enabled", c.replay_enabled);
     obs_data_set_bool(d, "replay_only", c.replay_only);
     obs_data_set_int(d, "replay_seconds",  c.replay_seconds);
+    obs_data_set_int(d, "replay_max_size_mb", c.replay_max_size_mb);
 
     // New encoder settings fields
     obs_data_set_int   (d, "keyframe_interval_sec",   c.keyframe_interval_sec);
@@ -391,6 +392,7 @@ static SceneSlot::Config slot_from_data(obs_data_t* d)
     c.replay_enabled  = obs_data_get_bool(d, "replay_enabled");
     c.replay_only     = obs_data_get_bool(d, "replay_only");
     c.replay_seconds  = (uint32_t)obs_data_get_int(d, "replay_seconds");
+    c.replay_max_size_mb = (uint32_t)obs_data_get_int(d, "replay_max_size_mb");
 
     // Defaults + back-compat for older saved configs.
     if (c.video_encoder_id.empty()) c.video_encoder_id = "obs_x264";

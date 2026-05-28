@@ -22,6 +22,31 @@ following section headings as applicable:
 
 ## [Unreleased]
 
+### Fixed
+
+- Replay buffer no longer truncates to inconsistent short durations when
+  the rate-control mode is quality-based (CQP / CRF / CQ / ICQ / QVBR /
+  Lossless). The buffer's memory ceiling now scales with resolution x fps x
+  per-mode bits-per-pixel-per-frame estimate x 2x margin, so configured
+  replay duration is honored under typical scene complexity
+  (`008-fix-replay-quality-truncation`).
+
+### Added
+
+- Per-slot "Max replay buffer size (MB)" override in the slot editor --
+  empty / "Auto" uses the new auto-derived ceiling; a positive value
+  bypasses auto-derivation and is used verbatim. Editor shows the currently
+  resolved ceiling alongside the override field
+  (`008-fix-replay-quality-truncation`).
+
+### Changed
+
+- Replay-save log line now includes observed bitrate alongside the
+  auto-derived bitrate assumption. When the buffer's memory ceiling appears
+  to have caused early eviction, a hedged warning identifies the achieved
+  vs configured duration and names remediation knobs
+  (`008-fix-replay-quality-truncation`).
+
 ### Performance
 
 - Reuse `QTableWidgetItem` instances during dock refresh to eliminate

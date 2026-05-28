@@ -10,8 +10,17 @@
 #include <QMetaObject>
 
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <ctime>
+
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#else
+#include <sys/sysinfo.h>
+#endif
 
 // =============================================================================
 // rate control helpers
@@ -54,6 +63,90 @@ const char *const *quality_split_keys()
 }
 
 } // namespace rc_util
+
+// =============================================================================
+// replay buffer sizing helpers
+// =============================================================================
+
+namespace replay_buffer_util {
+
+static uint32_t popcount32(uint32_t v)
+{
+	uint32_t c = 0;
+	for (; v; v >>= 1)
+		c += v & 1;
+	return c;
+}
+
+uint64_t estimated_kbps(const SceneSlot::Config &cfg, const EffectiveRC &eff)
+{
+	double fps = cfg.fps_den > 0 ? (double)cfg.fps_num / cfg.fps_den : 60.0;
+	double video_bps;
+	if (rc_util::is_bitrate_based(eff.mode)) {
+		video_bps = (double)eff.value * 1000.0;
+	} else if (rc_util::is_lossless(eff.mode)) {
+		video_bps = 8.0 * cfg.width * cfg.height * fps;
+	} else {
+		video_bps = 0.55 * cfg.width * cfg.height * fps;
+	}
+	double audio_bps = (double)cfg.audio_bitrate * popcount32(cfg.audio_tracks) * 1000.0;
+	return (uint64_t)((video_bps + audio_bps) / 1000.0);
+}
+
+uint64_t auto_derived_max_size_mb(const SceneSlot::Config &cfg, const EffectiveRC &eff)
+{
+	return estimated_kbps(cfg, eff) * cfg.replay_seconds * 2 / (8 * 1024);
+}
+
+uint64_t available_physical_mb()
+{
+#ifdef _WIN32
+	MEMORYSTATUSEX msex{};
+	msex.dwLength = sizeof(msex);
+	if (!GlobalMemoryStatusEx(&msex))
+		return 0;
+	return (uint64_t)msex.ullAvailPhys / (1024 * 1024);
+#elif defined(__APPLE__)
+	int64_t mem = 0;
+	size_t sz = sizeof(mem);
+	if (sysctlbyname("hw.memsize", &mem, &sz, nullptr, 0) != 0)
+		return 0;
+	return (uint64_t)mem / (1024 * 1024);
+#else
+	struct sysinfo si {};
+	if (sysinfo(&si) != 0)
+		return 0;
+	return (uint64_t)si.freeram * si.mem_unit / (1024 * 1024);
+#endif
+}
+
+uint64_t resolve_max_size_mb(const SceneSlot::Config &cfg, const EffectiveRC &eff,
+                             bool *out_was_clamped, uint64_t *out_requested_mb)
+{
+	uint64_t auto_mb = auto_derived_max_size_mb(cfg, eff);
+	uint64_t requested_mb = (cfg.replay_max_size_mb > 0) ? cfg.replay_max_size_mb : auto_mb;
+	if (out_requested_mb)
+		*out_requested_mb = requested_mb;
+
+	uint64_t avail_mb = available_physical_mb();
+	uint64_t clamped_mb;
+	bool was_clamped;
+	if (avail_mb > 0 && requested_mb > avail_mb / 2) {
+		clamped_mb = avail_mb / 2;
+		was_clamped = true;
+	} else {
+		clamped_mb = requested_mb;
+		was_clamped = false;
+	}
+	if (out_was_clamped)
+		*out_was_clamped = was_clamped;
+
+	if (clamped_mb < 50)
+		return 0;
+	return clamped_mb;
+}
+
+} // namespace replay_buffer_util
 
 // =============================================================================
 // replay filename helpers
@@ -645,6 +738,8 @@ bool SceneSlot::start()
 		return false;
 	}
 
+	start_time_ns_.store(os_gettime_ns(), std::memory_order_release);
+
 	// Recording output is absent in replay-only mode.
 	if (rec_out_ && !obs_output_start(rec_out_)) {
 		blog(LOG_ERROR, "[multi-scene-rec] '%s' rec start failed: %s", cfg_.name.c_str(),
@@ -805,6 +900,16 @@ void SceneSlot::teardown_locked()
 	}
 	group_key_.clear();
 	encoder_fallback_ = false;
+
+	start_time_ns_.store(0, std::memory_order_release);
+	resolved_max_size_mb_.store(0, std::memory_order_release);
+	was_clamped_at_start_.store(false, std::memory_order_release);
+	replay_seconds_at_start_.store(0, std::memory_order_release);
+	assumed_kbps_at_start_.store(0, std::memory_order_release);
+	{
+		std::lock_guard<std::mutex> slk(stats_mtx_);
+		observed_kbps_ewma_ = 0.0;
+	}
 }
 
 // =============================================================================
@@ -884,52 +989,98 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 
 	// ---- replay buffer (optional) ----
 	if (cfg_.replay_enabled) {
-		// Size cap is a safety net. For quality-based rate control there is no
-		// bitrate figure, so assume a generous 12 Mbps for the estimate. For
-		// consumer slots `eff` reflects the OWNER's effective mode/value (route
-		// resolved before slot_mtx_ in start()).
-		uint32_t est_kbps = rc_util::is_bitrate_based(eff.mode) ? eff.value : 12000;
-		auto popcount = [](uint32_t v) -> uint32_t {
-			uint32_t c = 0;
-			for (; v; v >>= 1)
-				c += v & 1;
-			return c;
-		};
-		est_kbps += cfg_.audio_bitrate * popcount(cfg_.audio_tracks);
+		bool was_clamped = false;
+		uint64_t requested_mb = 0;
+		uint64_t resolved_mb = replay_buffer_util::resolve_max_size_mb(
+			cfg_, eff, &was_clamped, &requested_mb);
 
-		obs_data_t *rb = obs_data_create();
-		obs_data_set_string(rb, "directory", cfg_.path.c_str());
-		obs_data_set_string(rb, "format", replay_util::build_replay_format(cfg_).c_str());
-		obs_data_set_string(rb, "extension", cfg_.container.empty() ? "mp4" : cfg_.container.c_str());
-		obs_data_set_int(rb, "max_time_sec", cfg_.replay_seconds);
-		uint64_t max_size_mb = (uint64_t)est_kbps * cfg_.replay_seconds / 8 / 1024 * 3 / 2;
-		if (max_size_mb < 50)
-			max_size_mb = 50;
-		obs_data_set_int(rb, "max_size_mb", (long long)max_size_mb);
-
-		replay_out_ = obs_output_create("replay_buffer", ("replay_out_" + cfg_.id).c_str(), rb, nullptr);
-		obs_data_release(rb);
-		if (!replay_out_) {
-			blog(LOG_WARNING, "[multi-scene-rec] '%s' replay create failed", cfg_.name.c_str());
+		if (resolved_mb == 0) {
+			blog(LOG_ERROR,
+			     "[multi-scene-rec] '%s': replay buffer DECLINED — "
+			     "even the clamped ceiling falls below the 50 MB defensive floor; "
+			     "host has only %llu MB available physical memory. Slot will start "
+			     "without a replay buffer. Remedies: set 'Max replay buffer size (MB)' "
+			     "smaller, lower replay duration, lower quality, or switch to a "
+			     "bitrate-based rate-control mode.",
+			     cfg_.name.c_str(),
+			     (unsigned long long)replay_buffer_util::available_physical_mb());
 		} else {
-			obs_output_set_video_encoder(replay_out_, venc_);
-			// Same track-aware attachment as the recording output.
-			for (size_t i = 0; i < aencs_.size(); ++i)
-				obs_output_set_audio_encoder(replay_out_, aencs_[i], (size_t)selected_tracks_[i]);
-			obs_output_set_mixers(replay_out_, cfg_.audio_tracks);
+			resolved_max_size_mb_.store(resolved_mb, std::memory_order_release);
+			was_clamped_at_start_.store(was_clamped, std::memory_order_release);
+			replay_seconds_at_start_.store(cfg_.replay_seconds, std::memory_order_release);
+			assumed_kbps_at_start_.store(
+				(uint32_t)replay_buffer_util::estimated_kbps(cfg_, eff),
+				std::memory_order_release);
 
-			// Detect external/error stops on the replay output too.
-			signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
-					       &SceneSlot::on_replay_output_stop, this);
-			// Truthful save-result audit: "saved" fires from the mux thread
-			// only after a successful on-disk write.
-			signal_handler_connect(obs_output_get_signal_handler(replay_out_), "saved",
-					       &SceneSlot::on_replay_saved, this);
+			uint64_t auto_mb = replay_buffer_util::auto_derived_max_size_mb(cfg_, eff);
+			uint32_t assumed_kbps = assumed_kbps_at_start_.load(std::memory_order_relaxed);
+			auto audio_kbps = [&]() -> uint32_t {
+				uint32_t tracks = cfg_.audio_tracks, c = 0;
+				for (; tracks; tracks >>= 1) c += tracks & 1;
+				return cfg_.audio_bitrate * c;
+			};
 
-			if (cfg_.container == "mp4" || cfg_.container == "MP4") {
+			if (was_clamped) {
 				blog(LOG_WARNING,
-				     "[multi-scene-rec] '%s': MP4 replay buffer will be unrecoverable if OBS crashes before save. Prefer MKV.",
-				     cfg_.name.c_str());
+				     "[multi-scene-rec] '%s': replay buffer requested %llu MB "
+				     "but clamped to %llu MB (host has %llu MB available). "
+				     "Configured %u s replay duration will NOT be honored under "
+				     "typical bitrate; clip will be shorter than configured. "
+				     "Remedies: set 'Max replay buffer size (MB)' to a smaller "
+				     "explicit value to suppress this warning, OR lower the "
+				     "replay duration, OR lower the rate-control quality, OR "
+				     "switch to a bitrate-based rate-control mode.",
+				     cfg_.name.c_str(),
+				     (unsigned long long)requested_mb,
+				     (unsigned long long)resolved_mb,
+				     (unsigned long long)replay_buffer_util::available_physical_mb(),
+				     cfg_.replay_seconds);
+			} else {
+				if (cfg_.replay_max_size_mb == 0) {
+					blog(LOG_INFO,
+					     "[multi-scene-rec] '%s': replay buffer reserved %llu MB "
+					     "(auto-derived from %ux%u@%ufps %s; assumes %u kbps total, "
+					     "incl. %u kbps audio)",
+					     cfg_.name.c_str(), (unsigned long long)resolved_mb,
+					     cfg_.width, cfg_.height,
+					     cfg_.fps_den > 0 ? cfg_.fps_num / cfg_.fps_den : cfg_.fps_num,
+					     eff.mode.c_str(), assumed_kbps, audio_kbps());
+				} else {
+					blog(LOG_INFO,
+					     "[multi-scene-rec] '%s': replay buffer reserved %llu MB "
+					     "(user override; auto-derived would have been %llu MB)",
+					     cfg_.name.c_str(), (unsigned long long)resolved_mb,
+					     (unsigned long long)auto_mb);
+				}
+			}
+
+			obs_data_t *rb = obs_data_create();
+			obs_data_set_string(rb, "directory", cfg_.path.c_str());
+			obs_data_set_string(rb, "format", replay_util::build_replay_format(cfg_).c_str());
+			obs_data_set_string(rb, "extension", cfg_.container.empty() ? "mp4" : cfg_.container.c_str());
+			obs_data_set_int(rb, "max_time_sec", cfg_.replay_seconds);
+			obs_data_set_int(rb, "max_size_mb", (long long)resolved_mb);
+
+			replay_out_ = obs_output_create("replay_buffer", ("replay_out_" + cfg_.id).c_str(), rb, nullptr);
+			obs_data_release(rb);
+			if (!replay_out_) {
+				blog(LOG_WARNING, "[multi-scene-rec] '%s' replay create failed", cfg_.name.c_str());
+			} else {
+				obs_output_set_video_encoder(replay_out_, venc_);
+				for (size_t i = 0; i < aencs_.size(); ++i)
+					obs_output_set_audio_encoder(replay_out_, aencs_[i], (size_t)selected_tracks_[i]);
+				obs_output_set_mixers(replay_out_, cfg_.audio_tracks);
+
+				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
+						       &SceneSlot::on_replay_output_stop, this);
+				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "saved",
+						       &SceneSlot::on_replay_saved, this);
+
+				if (cfg_.container == "mp4" || cfg_.container == "MP4") {
+					blog(LOG_WARNING,
+					     "[multi-scene-rec] '%s': MP4 replay buffer will be unrecoverable if OBS crashes before save. Prefer MKV.",
+					     cfg_.name.c_str());
+				}
 			}
 		}
 	}
@@ -1158,11 +1309,6 @@ void SceneSlot::on_replay_saved(void *data, calldata_t * /*cd*/)
 	self->log_replay_saved();
 }
 
-// NO plugin locks. Reads cfg_.name and replay_out_ lock-free (same convention
-// as on_replay_output_stop at slot.cpp above). Calls get_last_replay on the
-// replay-buffer output's proc handler; the precondition (muxing == false) is
-// satisfied because the "saved" signal fires only after the mux thread sets
-// muxing = false (obs-ffmpeg-mux.c:1128 before :1133).
 void SceneSlot::log_replay_saved()
 {
 	if (!replay_out_) {
@@ -1178,8 +1324,63 @@ void SceneSlot::log_replay_saved()
 	calldata_init(&cd);
 	proc_handler_call(ph, "get_last_replay", &cd);
 	const char *path = calldata_string(&cd, "path");
-	blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '%s'", cfg_.name.c_str(),
-	     (path && *path) ? path : "<unknown>");
+
+	uint64_t start_ns = start_time_ns_.load(std::memory_order_acquire);
+	uint64_t uptime_sec = start_ns ? (os_gettime_ns() - start_ns) / 1000000000ULL : 0;
+	uint64_t resolved_mb = resolved_max_size_mb_.load(std::memory_order_acquire);
+	bool was_clamped = was_clamped_at_start_.load(std::memory_order_acquire);
+	uint32_t replay_seconds = replay_seconds_at_start_.load(std::memory_order_acquire);
+	uint32_t assumed_kbps = assumed_kbps_at_start_.load(std::memory_order_acquire);
+
+	double ewma_kbps = 0.0;
+	{
+		std::lock_guard<std::mutex> lk(stats_mtx_);
+		ewma_kbps = observed_kbps_ewma_;
+	}
+
+	if (ewma_kbps > 0.0) {
+		blog(LOG_INFO,
+		     "[multi-scene-rec] '%s' replay save wrote '%s' "
+		     "(observed %.0f Mbps, assumed %.0f Mbps)",
+		     cfg_.name.c_str(),
+		     (path && *path) ? path : "<unknown>",
+		     ewma_kbps / 1000.0,
+		     assumed_kbps / 1000.0);
+	} else {
+		blog(LOG_INFO,
+		     "[multi-scene-rec] '%s' replay save wrote '%s' "
+		     "(observed N/A, assumed %.0f Mbps)",
+		     cfg_.name.c_str(),
+		     (path && *path) ? path : "<unknown>",
+		     assumed_kbps / 1000.0);
+	}
+
+	uint64_t needed_mb = (uint64_t)(ewma_kbps * replay_seconds / 8 / 1024);
+
+	if (uptime_sec >= replay_seconds &&
+	    needed_mb > resolved_mb &&
+	    !was_clamped &&
+	    ewma_kbps > 0.0) {
+		blog(LOG_WARNING,
+		     "[multi-scene-rec] '%s' replay save likely truncated to "
+		     "less than configured %u s: observed %.0f Mbps suggests buffer needed "
+		     "~%llu MB but resolved cap is %llu MB (auto-derived assumed %.0f Mbps); "
+		     "suspected memory cap (cause not directly confirmed). "
+		     "Consider setting 'Max replay buffer size (MB)' override, lowering "
+		     "replay duration, or lowering quality.",
+		     cfg_.name.c_str(), replay_seconds,
+		     ewma_kbps / 1000.0,
+		     (unsigned long long)needed_mb,
+		     (unsigned long long)resolved_mb,
+		     assumed_kbps / 1000.0);
+	} else if (start_ns != 0 && uptime_sec < replay_seconds) {
+		blog(LOG_INFO,
+		     "[multi-scene-rec] '%s' note: slot uptime %llu s < configured "
+		     "replay %u s; saved file will be shorter than configured (this is "
+		     "expected \xe2\x80\x94 buffer hadn't filled).",
+		     cfg_.name.c_str(), (unsigned long long)uptime_sec, replay_seconds);
+	}
+
 	calldata_free(&cd);
 }
 
@@ -1259,6 +1460,14 @@ SceneSlot::Stats SceneSlot::stats()
 	last_sample_bytes_ns_ = now_ns;
 	last_sample_bytes_ = out.total_bytes;
 	out.kbps = last_kbps_;
+
+	// FR-014/FR-011: maintain EWMA of observed kbps for save-time inference.
+	constexpr double alpha = 0.25;
+	if (observed_kbps_ewma_ == 0.0)
+		observed_kbps_ewma_ = last_kbps_;
+	else
+		observed_kbps_ewma_ = alpha * last_kbps_ + (1.0 - alpha) * observed_kbps_ewma_;
+
 	return out;
 }
 
@@ -1268,4 +1477,5 @@ void SceneSlot::reset_stats_sampler()
 	last_sample_bytes_ns_ = 0;
 	last_sample_bytes_ = 0;
 	last_kbps_ = 0.0;
+	observed_kbps_ewma_ = 0.0;
 }

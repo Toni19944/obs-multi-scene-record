@@ -24,6 +24,7 @@ private slots:
     void on_browse_path();
     void on_encoder_changed();   // re-introspect rate control modes
     void on_rc_changed();        // relabel + re-range the value field
+    void on_replay_max_size_inputs_changed();
 
 private:
     void populate_scene_combo();
@@ -92,6 +93,8 @@ private:
     QCheckBox*  replay_check_   = nullptr;
     QCheckBox*  replay_only_check_ = nullptr;
     QSpinBox*   replay_secs_    = nullptr;
+    QSpinBox*   replay_max_size_spin_ = nullptr;
+    QLabel*     replay_max_size_label_ = nullptr;
     QLabel*     replay_mp4_warn_ = nullptr; // MP4-replay caution label
     std::array<QCheckBox*, 6> track_checks_{};
 
