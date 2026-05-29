@@ -5,7 +5,14 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <memory>
 #include <vector>
+
+// Forward-declared so SceneSlot::setup_outputs can take it by const-ref. The
+// full definition lives in manager.hpp, which itself includes this header —
+// breaking the cycle with a forward declaration here keeps both directions
+// safe.
+struct EffectiveRC;
 
 // One independent recording + optional replay buffer.
 //
@@ -25,7 +32,7 @@
 // Rate control: the mode string and its value are stored generically. The
 //        editor discovers valid modes by introspecting the encoder's
 //        properties, so this struct doesn't hardcode any encoder specifics.
-class SceneSlot {
+class SceneSlot : public std::enable_shared_from_this<SceneSlot> {
 public:
     struct Config {
         // Stable unique identity, generated once, persisted. Used for hotkey
@@ -60,6 +67,10 @@ public:
         // recording file. Implies replay_enabled. Save clips via hotkey/button.
         bool replay_only = false;
         uint32_t replay_seconds = 30;
+
+        // FR-012: per-slot user override for the replay buffer's max_size_mb.
+        // 0 = auto-derived per replay_buffer_util::resolve_max_size_mb.
+        uint32_t replay_max_size_mb = 0;
 
         // ---- Video encoder: user-configurable ----
 
@@ -226,9 +237,26 @@ public:
     static void on_rec_output_stop(void* data, calldata_t* cd);
     static void on_replay_output_stop(void* data, calldata_t* cd);
 
+    // Replay-buffer "saved" signal handler. Fired by libobs from the mux
+    // worker thread only after a successful on-disk write (per
+    // obs-ffmpeg-mux.c:1130-1134). Takes NO plugin locks; the
+    // signal_handler_disconnect in teardown_locked is the synchronization
+    // barrier.
+    static void on_replay_saved(void* data, calldata_t* cd);
+
 private:
+    // Instance helper called by on_replay_saved. Emits the truthful
+    // "wrote '<path>'" log line using the path from the replay output's
+    // get_last_replay proc. NO plugin locks.
+    void log_replay_saved();
+
     bool setup_encoders();
-    bool setup_outputs();
+    // Resolved rate-control passed in by start() before taking slot_mtx_, so
+    // the replay-buffer memory-cap estimate uses the OWNER's effective values
+    // (consumer reads route through SlotManager::effective_rate_control). The
+    // helper takes mtx_ then shared_mtx_ independently; resolving before
+    // slot_mtx_ keeps the global order mtx_ -> slot_mtx_ -> shared_mtx_.
+    bool setup_outputs(const struct EffectiveRC& eff);
     // Public locking entry point: acquires slot_mtx_ then calls teardown_locked().
     void teardown();
     // Core teardown. Caller MUST already hold slot_mtx_ (e.g. start()'s
@@ -249,6 +277,17 @@ private:
 
     Config cfg_;
     std::atomic<bool> running_{false};
+
+    // FR-011: wall-clock slot start time for uptime check in log_replay_saved.
+    std::atomic<uint64_t> start_time_ns_{0};
+    // FR-011/FR-014: snapshot of resolved replay-buffer ceiling from setup_outputs.
+    std::atomic<uint64_t> resolved_max_size_mb_{0};
+    // FR-011: whether the FR-006 clamp-and-warn fired at slot start.
+    std::atomic<bool> was_clamped_at_start_{false};
+    // FR-011: snapshot of cfg_.replay_seconds at slot start (lock-free read in save callback).
+    std::atomic<uint32_t> replay_seconds_at_start_{0};
+    // FR-014: snapshot of auto-derived bitrate assumption at slot start.
+    std::atomic<uint32_t> assumed_kbps_at_start_{0};
 
     // Local copy of the shared context's fallback flag, taken at start() so
     // stats() can surface "[CBR fallback]" for the owner AND every sharer
@@ -273,6 +312,9 @@ private:
 
     obs_output_t* rec_out_    = nullptr;
     obs_output_t* replay_out_ = nullptr;
+
+    struct HotkeyHandle { std::weak_ptr<SceneSlot> wp; };
+    HotkeyHandle* hotkey_handle_ = nullptr;
 
     obs_hotkey_id hotkey_record_ = OBS_INVALID_HOTKEY_ID;
     obs_hotkey_id hotkey_replay_ = OBS_INVALID_HOTKEY_ID;
@@ -300,7 +342,31 @@ private:
     uint64_t   last_sample_bytes_ns_ = 0;
     uint64_t   last_sample_bytes_    = 0;
     double     last_kbps_            = 0.0;
+    // FR-014: EWMA-smoothed observed kbps for save-time FR-011 inference.
+    double     observed_kbps_ewma_  = 0.0;
 };
+
+// --- replay filename helpers -------------------------------------------------
+//
+// Declared after class SceneSlot because build_replay_format reads SceneSlot::Config
+// (a nested type that cannot be forward-declared from outside the enclosing class).
+// Both functions are pure: no globals, no logging, no plugin locks acquired.
+
+namespace replay_util {
+
+// Replace path-unsafe characters in `name` with `_`, collapse `_` runs,
+// strip leading/trailing `{_, ., space}`, and prepend `_` if the result
+// matches a Windows reserved device name. See specs/007-fix-replay-collision
+// data-model.md § Sanitization rule for the exact character set.
+std::string sanitize_for_filename(const std::string &name);
+
+// Build the OBS replay-buffer "format" setting:
+//   "<NAME>_<ID6>_Replay_%CCYY-%MM-%DD_%hh-%mm-%ss"
+// <NAME> = sanitize_for_filename(cfg.name), or "slot" when empty.
+// <ID6>  = last 6 hex chars of cfg.id (whole id if shorter than 6).
+std::string build_replay_format(const SceneSlot::Config &cfg);
+
+} // namespace replay_util
 
 // --- rate control helpers (shared with the UI editor) ------------------------
 
@@ -313,4 +379,36 @@ bool is_bitrate_based(const std::string& mode);
 // True if `mode` takes no numeric value at all.
 bool is_lossless(const std::string& mode);
 
+// Canonical, null-terminated list of single-key encoder property names that
+// carry a quality-mode value (CRF / CQP / CQ / ICQ / Global Quality). The
+// FIRST present key wins for both editor range introspection
+// (introspect_quality_range) and the encoder-build write target
+// (set_quality_value) — both call sites walk this list, so any future PR that
+// adds a key to one side without the other becomes a compile-time follow-
+// through to this single source.
+const char* const* quality_keys();
+
+// Null-terminated list of QSV "split" quality keys. Set as a unit when none of
+// quality_keys() matched but any of these do (matches set_quality_value).
+const char* const* quality_split_keys();
+
 } // namespace rc_util
+
+// --- replay buffer sizing helpers -------------------------------------------
+
+namespace replay_buffer_util {
+
+// Per-mode combined video+audio bitrate estimate in kbps.
+uint64_t estimated_kbps(const SceneSlot::Config &cfg, const struct EffectiveRC &eff);
+
+// Auto-derived max_size_mb from estimated_kbps × replay_seconds × 2× margin.
+uint64_t auto_derived_max_size_mb(const SceneSlot::Config &cfg, const struct EffectiveRC &eff);
+
+// Host available physical RAM in MB (platform-specific). Returns 0 on failure.
+uint64_t available_physical_mb();
+
+// Entry point: returns the resolved cap (0 = decline replay buffer).
+uint64_t resolve_max_size_mb(const SceneSlot::Config &cfg, const struct EffectiveRC &eff,
+                             bool *out_was_clamped, uint64_t *out_requested_mb);
+
+} // namespace replay_buffer_util
