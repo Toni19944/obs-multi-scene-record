@@ -1,22 +1,28 @@
 <!--
 Sync Impact Report
 ==================
-Version change: 1.2.0 → 1.3.0
-Modified principles:
-  - VII. Recording & Replay Buffer Correctness (NON-NEGOTIABLE): added a
-    "Host-resource precondition" sub-section that scopes the principle's
-    MUSTs to the case where the host can allocate the required resources,
-    and admits feature-agnostic degraded operation under three conditions
-    (loud surfacing, slot-local confinement, non-silent at save time).
-    Silent degradation remains ship-blocking. No MUST removed.
-Added sections: None (sub-section added inside Principle VII)
+Version change: 1.3.0 → 1.4.0
+Modified sections:
+  - Development Workflow → "Patch notes": expanded from a single bullet
+    into a multi-rule sub-section with three new MUSTs:
+    (1) Prior changelog history MUST NOT be cleared or overwritten.
+    (2) New changes MUST be added under a dedicated new [Unreleased] block.
+    (3) Version tagging is performed manually by the maintainer; automated
+        tools MUST NOT assign version numbers or collapse [Unreleased]
+        blocks.
+Added sections: None
 Removed sections: None
 Templates:
-  - .specify/templates/plan-template.md  ✅ Constitution Check is generic; no change required
-  - .specify/templates/spec-template.md  ✅ No constitution-specific references; no change required
-  - .specify/templates/tasks-template.md ✅ No constitution-specific references; no change required
+  - .specify/templates/plan-template.md  ✅ No changelog references; no change required
+  - .specify/templates/spec-template.md  ✅ No changelog references; no change required
+  - .specify/templates/tasks-template.md ✅ No changelog references; no change required
   - .specify/templates/commands/         ✅ No command files present
+  - CLAUDE.md                            ✅ No changelog references; no change required
 Deferred TODOs: None
+
+Previous report (v1.2.0 → v1.3.0):
+  VII. Recording & Replay Buffer Correctness (NON-NEGOTIABLE): added a
+  "Host-resource precondition" sub-section.
 
 Previous report (v1.1.0 → v1.2.0):
   Added Development Workflow bullet "Patch notes" requiring a CHANGELOG-style
@@ -245,10 +251,21 @@ the most popular and most well-regarded OBS plugins. To reach that bar:
   alongside the plugin source. There is no patch-file workflow.
 - **Commit hygiene**: Each logical change is its own commit. Force-pushes to
   `master`/`main` are forbidden.
-- **Patch notes**: A Markdown patch-notes file MUST exist at the repository
-  root (canonical name: `CHANGELOG.md`). Every new feature and every bug fix
-  MUST add an entry to that file documenting the user-visible change before
-  the work is merged.
+- **Patch notes / CHANGELOG**:
+  - A Markdown patch-notes file MUST exist at the repository root (canonical
+    name: `CHANGELOG.md`). Every new feature and every bug fix MUST add an
+    entry to that file documenting the user-visible change before the work
+    is merged.
+  - Prior changelog history MUST NOT be cleared, truncated, or overwritten.
+    All previously released version blocks (most recent: v1.0.5, manually
+    tagged by the maintainer) MUST be preserved verbatim.
+  - New changes MUST be placed in their own dedicated `[Unreleased]` block
+    at the top of the file. If an `[Unreleased]` block already exists with
+    entries from the current work stream, new entries MUST be appended to
+    it rather than replacing it.
+  - Version tagging is performed manually by the maintainer. Automated
+    tooling MUST NOT assign version numbers, collapse `[Unreleased]` blocks
+    into versioned blocks, or otherwise alter the release history.
 
 ## Governance
 
@@ -277,4 +294,4 @@ cite Principle IX and document the migration in the release notes.
 
 **Runtime guidance**: See `CLAUDE.md` for agent-specific development guidance.
 
-**Version**: 1.3.0 | **Ratified**: 2026-05-19 | **Last Amended**: 2026-05-26
+**Version**: 1.4.0 | **Ratified**: 2026-05-19 | **Last Amended**: 2026-05-29
