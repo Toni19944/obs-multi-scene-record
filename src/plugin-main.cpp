@@ -27,13 +27,14 @@ static void dock_create_cb(enum obs_frontend_event event, void*)
     auto* main_window = static_cast<QMainWindow*>(obs_frontend_get_main_window());
     if (!main_window) return;
     g_dock = new MultiSceneRecordDock(main_window);
+    QObject::connect(g_dock, &QObject::destroyed, [](){ g_dock = nullptr; });
     obs_frontend_add_dock_by_id(
         "multi_scene_record_dock", "Multi-Scene Record", g_dock);
 }
 
 bool obs_module_load(void)
 {
-    blog(LOG_INFO, "[multi-scene-rec] loading v%s", "1.0.0");
+    blog(LOG_INFO, "[multi-scene-rec] loading v%s", PLUGIN_VERSION);
     SlotManager::instance().init();
 
     // Create dock once the frontend is up.

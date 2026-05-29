@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <mutex>
 
@@ -70,6 +71,12 @@ public:
 
     void init();
     void shutdown();
+
+    struct SlotSnapshot {
+        std::vector<std::shared_ptr<SceneSlot>> items;
+        size_t generation;
+    };
+    SlotSnapshot snapshot_slots() const;
 
     // CRUD
     size_t slot_count() const;
@@ -147,10 +154,13 @@ private:
     static void save_cb(obs_data_t* save_data, bool saving, void* ptr);
 
     mutable std::mutex mtx_;
-    std::vector<std::unique_ptr<SceneSlot>> slots_;
+    std::vector<std::shared_ptr<SceneSlot>> slots_;
     bool started_ = false;
     // Bumped under mtx_ each time slots_ is rebuilt by load_from().
     size_t generation_ = 0;
+    std::unordered_map<std::string, size_t> id_index_;
+
+    void rebuild_id_index();
 
     // Shared-encoder registry, keyed by encoder-group key (the group-key
     // slot's id). Guarded by its OWN dedicated leaf mutex so acquire/release

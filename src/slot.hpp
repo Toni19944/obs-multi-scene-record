@@ -5,6 +5,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <memory>
 #include <vector>
 
 // Forward-declared so SceneSlot::setup_outputs can take it by const-ref. The
@@ -31,7 +32,7 @@ struct EffectiveRC;
 // Rate control: the mode string and its value are stored generically. The
 //        editor discovers valid modes by introspecting the encoder's
 //        properties, so this struct doesn't hardcode any encoder specifics.
-class SceneSlot {
+class SceneSlot : public std::enable_shared_from_this<SceneSlot> {
 public:
     struct Config {
         // Stable unique identity, generated once, persisted. Used for hotkey
@@ -311,6 +312,9 @@ private:
 
     obs_output_t* rec_out_    = nullptr;
     obs_output_t* replay_out_ = nullptr;
+
+    struct HotkeyHandle { std::weak_ptr<SceneSlot> wp; };
+    HotkeyHandle* hotkey_handle_ = nullptr;
 
     obs_hotkey_id hotkey_record_ = OBS_INVALID_HOTKEY_ID;
     obs_hotkey_id hotkey_replay_ = OBS_INVALID_HOTKEY_ID;

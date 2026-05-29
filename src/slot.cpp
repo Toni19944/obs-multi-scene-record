@@ -16,8 +16,9 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <intrin.h>
 #elif defined(__APPLE__)
-#include <sys/sysctl.h>
+#include <mach/mach.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -72,10 +73,11 @@ namespace replay_buffer_util {
 
 static uint32_t popcount32(uint32_t v)
 {
-	uint32_t c = 0;
-	for (; v; v >>= 1)
-		c += v & 1;
-	return c;
+#if defined(_MSC_VER)
+	return __popcnt(v);
+#else
+	return (uint32_t)__builtin_popcount(v);
+#endif
 }
 
 uint64_t estimated_kbps(const SceneSlot::Config &cfg, const EffectiveRC &eff)
@@ -107,12 +109,28 @@ uint64_t available_physical_mb()
 		return 0;
 	return (uint64_t)msex.ullAvailPhys / (1024 * 1024);
 #elif defined(__APPLE__)
-	int64_t mem = 0;
-	size_t sz = sizeof(mem);
-	if (sysctlbyname("hw.memsize", &mem, &sz, nullptr, 0) != 0)
+	mach_port_t host = mach_host_self();
+	vm_statistics64_data_t stats;
+	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+	if (host_statistics64(host, HOST_VM_INFO64,
+			      reinterpret_cast<host_info64_t>(&stats), &count) != KERN_SUCCESS)
 		return 0;
-	return (uint64_t)mem / (1024 * 1024);
+	uint64_t avail_bytes = ((uint64_t)stats.free_count
+			      + (uint64_t)stats.inactive_count) * vm_page_size;
+	return avail_bytes / (1024 * 1024);
 #else
+	FILE *f = fopen("/proc/meminfo", "r");
+	if (f) {
+		char line[128];
+		while (fgets(line, sizeof(line), f)) {
+			unsigned long long kb;
+			if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+				fclose(f);
+				return (uint64_t)(kb / 1024);
+			}
+		}
+		fclose(f);
+	}
 	struct sysinfo si {};
 	if (sysinfo(&si) != 0)
 		return 0;
@@ -244,17 +262,19 @@ std::string build_replay_format(const SceneSlot::Config &cfg)
 // helpers
 // =============================================================================
 
-static std::string generate_slot_id()
+namespace {
+
+std::string generate_slot_id()
 {
 	static std::atomic<uint32_t> counter{0};
 	uint64_t t = os_gettime_ns();
 	uint32_t c = counter.fetch_add(1);
 	char buf[40];
-	std::snprintf(buf, sizeof(buf), "%llx%x", (unsigned long long)t, c);
+	std::snprintf(buf, sizeof(buf), "%llx-%x", (unsigned long long)t, c);
 	return buf;
 }
 
-static obs_source_t *fetch_scene_source(const std::string &name)
+obs_source_t *fetch_scene_source(const std::string &name)
 {
 	obs_source_t *s = obs_get_source_by_name(name.c_str());
 	if (!s)
@@ -266,7 +286,7 @@ static obs_source_t *fetch_scene_source(const std::string &name)
 	return s;
 }
 
-static std::string build_output_filename(const SceneSlot::Config &cfg)
+std::string build_output_filename(const SceneSlot::Config &cfg)
 {
 	char ts[64];
 	time_t now = time(nullptr);
@@ -279,13 +299,25 @@ static std::string build_output_filename(const SceneSlot::Config &cfg)
 	if (!strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tmv))
 		std::snprintf(ts, sizeof(ts), "%lld", (long long)now);
 
+	std::string safe_name = replay_util::sanitize_for_filename(cfg.name);
+	if (safe_name.empty())
+		safe_name = "slot";
+
+	std::string id6;
+	if (cfg.id.size() >= 6)
+		id6 = cfg.id.substr(cfg.id.size() - 6);
+	else
+		id6 = cfg.id;
+
 	std::string path = cfg.path;
 	if (!path.empty() && path.back() != '/' && path.back() != '\\')
 		path += '/';
-	path += cfg.name.empty() ? std::string("slot") : cfg.name;
-	path += "_";
+	path += safe_name;
+	path += '_';
+	path += id6;
+	path += '_';
 	path += ts;
-	path += ".";
+	path += '.';
 	path += cfg.container.empty() ? std::string("mp4") : cfg.container;
 	return path;
 }
@@ -293,7 +325,7 @@ static std::string build_output_filename(const SceneSlot::Config &cfg)
 // Write the quality value into whichever quality-named setting the encoder
 // actually exposes — discovered by introspecting its properties. Setting a key
 // the encoder doesn't have is avoided; this keeps us encoder-agnostic.
-static void set_quality_value(obs_data_t *settings, const char *enc_id, int value)
+void set_quality_value(obs_data_t *settings, const char *enc_id, int value)
 {
 	obs_properties_t *props = obs_get_encoder_properties(enc_id);
 	if (!props) {
@@ -326,7 +358,7 @@ static void set_quality_value(obs_data_t *settings, const char *enc_id, int valu
 // Encoder-family presets that are orthogonal to rate control: speed preset,
 // h264 profile, tuning, multipass, etc. Matched by ID substring so newer ID
 // variants still resolve.
-static void apply_family_presets(obs_data_t *s, const std::string &enc_id, const SceneSlot::Config &cfg)
+void apply_family_presets(obs_data_t *s, const std::string &enc_id, const SceneSlot::Config &cfg)
 {
 	obs_data_set_int(s, "keyint_sec", cfg.keyframe_interval_sec);
 
@@ -433,7 +465,7 @@ static void apply_family_presets(obs_data_t *s, const std::string &enc_id, const
 
 // Full encoder settings: family presets + the configured rate control mode
 // and its value, routed to the correct key by introspection.
-static void apply_encoder_settings(obs_data_t *s, const std::string &enc_id, const SceneSlot::Config &cfg)
+void apply_encoder_settings(obs_data_t *s, const std::string &enc_id, const SceneSlot::Config &cfg)
 {
 	apply_family_presets(s, enc_id, cfg);
 
@@ -448,6 +480,8 @@ static void apply_encoder_settings(obs_data_t *s, const std::string &enc_id, con
 		set_quality_value(s, enc_id.c_str(), (int)cfg.rc_value);
 	}
 }
+
+} // anonymous namespace
 
 // =============================================================================
 // shared encoder context (scene/view/video/encoder pipeline)
@@ -645,20 +679,22 @@ bool SceneSlot::start()
 	std::string group_key;
 	SceneSlot::Config owner_cfg;
 	{
-		// Brief unlocked read of cfg_ identity fields only, exactly as the
-		// former pre-slot_mtx_ resolution did.
+		std::lock_guard<std::mutex> pre_lk(slot_mtx_);
 		const std::string dep_id = cfg_.shared_encoder_slot_id;
 		if (!dep_id.empty()) {
 			group_key = dep_id;
-			if (!SlotManager::instance().config_by_slot_id(dep_id, owner_cfg)) {
-				blog(LOG_ERROR, "[multi-scene-rec] '%s': encoder source slot '%s' not found",
-				     cfg_.name.c_str(), dep_id.c_str());
-				running_.store(false);
-				return false;
-			}
 		} else {
 			group_key = cfg_.id;
 			owner_cfg = cfg_;
+		}
+	}
+	if (!group_key.empty() && owner_cfg.id.empty()) {
+		if (!SlotManager::instance().config_by_slot_id(group_key, owner_cfg)) {
+			std::lock_guard<std::mutex> pre_lk(slot_mtx_);
+			blog(LOG_ERROR, "[multi-scene-rec] '%s': encoder source slot '%s' not found",
+			     cfg_.name.c_str(), group_key.c_str());
+			running_.store(false);
+			return false;
 		}
 	}
 
@@ -804,24 +840,68 @@ void SceneSlot::stop()
 
 void SceneSlot::teardown()
 {
-	// Public entry: take slot_mtx_ (guards all members touched below), then
-	// run the core. start()'s in-lock failure paths call teardown_locked()
-	// directly since they already hold slot_mtx_ (non-recursive).
-	std::lock_guard<std::mutex> lk(slot_mtx_);
-	teardown_locked();
+	obs_output_t *local_rec = nullptr;
+	obs_output_t *local_replay = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(slot_mtx_);
+		if (rec_out_) {
+			signal_handler_disconnect(obs_output_get_signal_handler(rec_out_), "stop",
+						  &SceneSlot::on_rec_output_stop, hotkey_handle_);
+			obs_output_stop(rec_out_);
+		}
+		if (replay_out_) {
+			signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "saved",
+						  &SceneSlot::on_replay_saved, hotkey_handle_);
+			signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "stop",
+						  &SceneSlot::on_replay_output_stop, hotkey_handle_);
+			obs_output_stop(replay_out_);
+		}
+		local_rec = rec_out_;
+		local_replay = replay_out_;
+		rec_out_ = nullptr;
+		replay_out_ = nullptr;
+	}
+	wait_for_output_stop(local_rec);
+	wait_for_output_stop(local_replay);
+	{
+		std::lock_guard<std::mutex> lk(slot_mtx_);
+		if (local_rec)
+			obs_output_release(local_rec);
+		if (local_replay)
+			obs_output_release(local_replay);
+		for (auto *aenc : aencs_)
+			if (aenc)
+				obs_encoder_release(aenc);
+		aencs_.clear();
+		selected_tracks_.clear();
+		if (venc_) {
+			SlotManager::instance().release_shared_encoder(group_key_);
+			venc_ = nullptr;
+		}
+		group_key_.clear();
+		encoder_fallback_ = false;
+		start_time_ns_.store(0, std::memory_order_release);
+		resolved_max_size_mb_.store(0, std::memory_order_release);
+		was_clamped_at_start_.store(false, std::memory_order_release);
+		replay_seconds_at_start_.store(0, std::memory_order_release);
+		assumed_kbps_at_start_.store(0, std::memory_order_release);
+	}
+	{
+		std::lock_guard<std::mutex> slk(stats_mtx_);
+		observed_kbps_ewma_ = 0.0;
+	}
 }
 
 void SceneSlot::wait_for_output_stop(obs_output_t *out)
 {
 	if (!out)
 		return;
-	// obs_output_stop() is asynchronous: it only requests a stop. Block until
-	// the output's encode/mux thread has actually finished so destroying the
-	// view/encoders afterwards cannot be a use-after-free.
-	const int max_iters = 500; // 500 * 10 ms = 5 s
+	static constexpr int kStopTimeoutMs = 5000;
+	static constexpr int kStopPollMs = 10;
+	const int max_iters = kStopTimeoutMs / kStopPollMs;
 	int iters = 0;
 	while (obs_output_active(out) && iters < max_iters) {
-		os_sleep_ms(10);
+		os_sleep_ms(kStopPollMs);
 		++iters;
 	}
 	if (obs_output_active(out)) {
@@ -848,20 +928,14 @@ void SceneSlot::teardown_locked()
 	// (a) Disconnect stop-signal handlers, then request stop on both outputs.
 	if (rec_out_) {
 		signal_handler_disconnect(obs_output_get_signal_handler(rec_out_), "stop",
-					  &SceneSlot::on_rec_output_stop, this);
+					  &SceneSlot::on_rec_output_stop, hotkey_handle_);
 		obs_output_stop(rec_out_);
 	}
 	if (replay_out_) {
-		// Disconnect "saved" BEFORE "stop" so the mux-thread callback
-		// cannot fire after this thread proceeds to release the output.
-		// libobs's signal_handler_disconnect blocks on any in-flight
-		// dispatch (signal.c serializes dispatch/disconnect on the
-		// signal's internal mutex), so after this call returns
-		// on_replay_saved is guaranteed not running.
 		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "saved",
-					  &SceneSlot::on_replay_saved, this);
+					  &SceneSlot::on_replay_saved, hotkey_handle_);
 		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "stop",
-					  &SceneSlot::on_replay_output_stop, this);
+					  &SceneSlot::on_replay_output_stop, hotkey_handle_);
 		obs_output_stop(replay_out_);
 	}
 
@@ -981,9 +1055,8 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 		for (size_t i = 0; i < aencs_.size(); ++i)
 			obs_output_set_audio_encoder(rec_out_, aencs_[i], (size_t)selected_tracks_[i]);
 
-		// Detect external/error stops (disk full, encoder failure, ...).
 		signal_handler_connect(obs_output_get_signal_handler(rec_out_), "stop", &SceneSlot::on_rec_output_stop,
-				       this);
+				       hotkey_handle_);
 	}
 
 	// ---- replay buffer (optional) ----
@@ -1070,9 +1143,9 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 					obs_output_set_audio_encoder(replay_out_, aencs_[i], (size_t)selected_tracks_[i]);
 
 				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
-						       &SceneSlot::on_replay_output_stop, this);
+						       &SceneSlot::on_replay_output_stop, hotkey_handle_);
 				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "saved",
-						       &SceneSlot::on_replay_saved, this);
+						       &SceneSlot::on_replay_saved, hotkey_handle_);
 
 				if (cfg_.container == "mp4" || cfg_.container == "MP4") {
 					blog(LOG_WARNING,
@@ -1120,11 +1193,13 @@ void SceneSlot::register_hotkeys()
 	std::string rep_name = "multi_scene_rec.save_replay." + cfg_.id;
 	std::string rep_desc = "Save Replay: " + cfg_.name;
 
+	hotkey_handle_ = new HotkeyHandle{shared_from_this()};
+
 	if (hotkey_out_) {
 		hotkey_record_ = obs_hotkey_register_output(hotkey_out_, rec_name.c_str(), rec_desc.c_str(),
-							    &SceneSlot::on_record_hotkey, this);
+							    &SceneSlot::on_record_hotkey, hotkey_handle_);
 		hotkey_replay_ = obs_hotkey_register_output(hotkey_out_, rep_name.c_str(), rep_desc.c_str(),
-							    &SceneSlot::on_save_hotkey, this);
+							    &SceneSlot::on_save_hotkey, hotkey_handle_);
 	} else {
 		// Defensive fallback: if libobs refuses to create the sentinel output
 		// (e.g. OOM, or the hotkey system isn't ready), keep the hotkeys
@@ -1135,9 +1210,9 @@ void SceneSlot::register_hotkeys()
 		     "'%s'; registering hotkeys under Front-End instead",
 		     cfg_.name.c_str());
 		hotkey_record_ = obs_hotkey_register_frontend(rec_name.c_str(), rec_desc.c_str(),
-							      &SceneSlot::on_record_hotkey, this);
+							      &SceneSlot::on_record_hotkey, hotkey_handle_);
 		hotkey_replay_ = obs_hotkey_register_frontend(rep_name.c_str(), rep_desc.c_str(),
-							      &SceneSlot::on_save_hotkey, this);
+							      &SceneSlot::on_save_hotkey, hotkey_handle_);
 	}
 
 	// Re-apply any saved/captured binding to the now-live hotkey ids.
@@ -1237,85 +1312,104 @@ void SceneSlot::unregister_hotkeys()
 		obs_output_release(hotkey_out_);
 		hotkey_out_ = nullptr;
 	}
+	delete hotkey_handle_;
+	hotkey_handle_ = nullptr;
 }
 
 void SceneSlot::on_record_hotkey(void *data, obs_hotkey_id /*id*/, obs_hotkey_t * /*hk*/, bool pressed)
 {
 	if (!pressed)
 		return;
-	auto *self = static_cast<SceneSlot *>(data);
-	if (!self)
+	auto *h = static_cast<HotkeyHandle *>(data);
+	if (!h)
 		return;
-	if (self->is_running()) {
-		self->stop();
+	auto sp = h->wp.lock();
+	if (!sp)
+		return;
+	if (sp->is_running()) {
+		sp->stop();
 	} else {
-		self->start();
+		sp->start();
 	}
-	// Post-transition: reflect the slot's actual is_running() state in the
-	// dock state column. Queued onto the UI thread so this libobs-hotkey-
-	// thread callback never touches Qt widgets directly. Same pattern as
-	// on_rec_output_stop / on_replay_output_stop. A failed start() resets
-	// running_ to false before returning, so refresh() reads the honest
-	// post-transition state with no transient "active" flicker.
 	if (auto *dock = get_dock())
 		QMetaObject::invokeMethod(dock, "refresh", Qt::QueuedConnection);
 }
 
 void SceneSlot::on_rec_output_stop(void *data, calldata_t *cd)
 {
-	auto *self = static_cast<SceneSlot *>(data);
-	if (!self)
+	auto *h = static_cast<HotkeyHandle *>(data);
+	if (!h)
+		return;
+	auto sp = h->wp.lock();
+	if (!sp)
 		return;
 	long long code = calldata_int(cd, "code");
-	// OBS_OUTPUT_SUCCESS (0) == intentional stop (our own obs_output_stop()
-	// from teardown). Ignore to avoid double-teardown.
 	if (code == OBS_OUTPUT_SUCCESS)
 		return;
 
 	blog(LOG_WARNING, "[multi-scene-rec] '%s': recording output stopped externally (code %lld)",
-	     self->config().name.c_str(), code);
-	self->stop();
-	if (auto *dock = get_dock())
-		QMetaObject::invokeMethod(dock, "refresh", Qt::QueuedConnection);
+	     sp->config().name.c_str(), code);
+	auto *prevent_destroy = new std::shared_ptr<SceneSlot>(sp);
+	obs_queue_task(OBS_TASK_UI, [](void *d) {
+		auto *prevent = static_cast<std::shared_ptr<SceneSlot>*>(d);
+		(*prevent)->stop();
+		if (auto *dock = get_dock())
+			dock->refresh();
+		delete prevent;
+	}, prevent_destroy, false);
 }
 
 void SceneSlot::on_replay_output_stop(void *data, calldata_t *cd)
 {
-	auto *self = static_cast<SceneSlot *>(data);
-	if (!self)
+	auto *h = static_cast<HotkeyHandle *>(data);
+	if (!h)
+		return;
+	auto sp = h->wp.lock();
+	if (!sp)
 		return;
 	long long code = calldata_int(cd, "code");
 	if (code == OBS_OUTPUT_SUCCESS)
 		return;
 
 	blog(LOG_WARNING, "[multi-scene-rec] '%s': replay output stopped externally (code %lld)",
-	     self->config().name.c_str(), code);
-	self->stop();
-	if (auto *dock = get_dock())
-		QMetaObject::invokeMethod(dock, "refresh", Qt::QueuedConnection);
+	     sp->config().name.c_str(), code);
+	auto *prevent_destroy = new std::shared_ptr<SceneSlot>(sp);
+	obs_queue_task(OBS_TASK_UI, [](void *d) {
+		auto *prevent = static_cast<std::shared_ptr<SceneSlot>*>(d);
+		(*prevent)->stop();
+		if (auto *dock = get_dock())
+			dock->refresh();
+		delete prevent;
+	}, prevent_destroy, false);
 }
 
-// Runs on the OBS mux worker thread. Takes NO plugin locks (matching
-// on_replay_output_stop). The signal_handler_disconnect in teardown_locked
-// blocks on in-flight dispatch, so replay_out_ cannot be released while
-// this callback is executing.
 void SceneSlot::on_replay_saved(void *data, calldata_t * /*cd*/)
 {
-	auto *self = static_cast<SceneSlot *>(data);
-	if (!self)
+	auto *h = static_cast<HotkeyHandle *>(data);
+	if (!h)
 		return;
-	self->log_replay_saved();
+	auto sp = h->wp.lock();
+	if (!sp)
+		return;
+	sp->log_replay_saved();
 }
 
 void SceneSlot::log_replay_saved()
 {
-	if (!replay_out_) {
-		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", cfg_.name.c_str());
+	std::string name;
+	obs_output_t *replay = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(slot_mtx_);
+		name = cfg_.name;
+		replay = replay_out_;
+	}
+	if (!replay) {
+		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", name.c_str());
 		return;
 	}
-	proc_handler_t *ph = obs_output_get_proc_handler(replay_out_);
+	proc_handler_t *ph = obs_output_get_proc_handler(replay);
 	if (!ph) {
-		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", cfg_.name.c_str());
+		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", name.c_str());
 		return;
 	}
 	calldata_t cd;
@@ -1340,7 +1434,7 @@ void SceneSlot::log_replay_saved()
 		blog(LOG_INFO,
 		     "[multi-scene-rec] '%s' replay save wrote '%s' "
 		     "(observed %.0f Mbps, assumed %.0f Mbps)",
-		     cfg_.name.c_str(),
+		     name.c_str(),
 		     (path && *path) ? path : "<unknown>",
 		     ewma_kbps / 1000.0,
 		     assumed_kbps / 1000.0);
@@ -1348,7 +1442,7 @@ void SceneSlot::log_replay_saved()
 		blog(LOG_INFO,
 		     "[multi-scene-rec] '%s' replay save wrote '%s' "
 		     "(observed N/A, assumed %.0f Mbps)",
-		     cfg_.name.c_str(),
+		     name.c_str(),
 		     (path && *path) ? path : "<unknown>",
 		     assumed_kbps / 1000.0);
 	}
@@ -1366,7 +1460,7 @@ void SceneSlot::log_replay_saved()
 		     "suspected memory cap (cause not directly confirmed). "
 		     "Consider setting 'Max replay buffer size (MB)' override, lowering "
 		     "replay duration, or lowering quality.",
-		     cfg_.name.c_str(), replay_seconds,
+		     name.c_str(), replay_seconds,
 		     ewma_kbps / 1000.0,
 		     (unsigned long long)needed_mb,
 		     (unsigned long long)resolved_mb,
@@ -1376,7 +1470,7 @@ void SceneSlot::log_replay_saved()
 		     "[multi-scene-rec] '%s' note: slot uptime %llu s < configured "
 		     "replay %u s; saved file will be shorter than configured (this is "
 		     "expected \xe2\x80\x94 buffer hadn't filled).",
-		     cfg_.name.c_str(), (unsigned long long)uptime_sec, replay_seconds);
+		     name.c_str(), (unsigned long long)uptime_sec, replay_seconds);
 	}
 
 	calldata_free(&cd);
@@ -1386,9 +1480,12 @@ void SceneSlot::on_save_hotkey(void *data, obs_hotkey_id /*id*/, obs_hotkey_t * 
 {
 	if (!pressed)
 		return;
-	auto *self = static_cast<SceneSlot *>(data);
-	if (self)
-		self->save_replay();
+	auto *h = static_cast<HotkeyHandle *>(data);
+	if (!h)
+		return;
+	auto sp = h->wp.lock();
+	if (sp)
+		sp->save_replay();
 }
 
 bool SceneSlot::save_replay()
@@ -1427,23 +1524,24 @@ SceneSlot::Stats SceneSlot::stats()
 	if (!running_.load())
 		return out;
 
-	// slot_mtx_ guards rec_out_/replay_out_/cfg_/encoder_fallback_.
-	// stats_mtx_ (the bitrate sampler) is acquired AFTER slot_mtx_ to keep
-	// the global lock order slot_mtx_ -> stats_mtx_.
-	std::lock_guard<std::mutex> lk(slot_mtx_);
-
-	// In replay-only mode there is no rec_out_; fall back to the replay
-	// buffer output for the frame/byte counters.
-	obs_output_t *primary = rec_out_ ? rec_out_ : replay_out_;
+	obs_output_t *primary = nullptr;
+	obs_output_t *replay = nullptr;
+	bool fallback = false;
+	{
+		std::lock_guard<std::mutex> lk(slot_mtx_);
+		primary = rec_out_ ? rec_out_ : replay_out_;
+		replay = replay_out_;
+		fallback = encoder_fallback_;
+	}
 	if (!primary)
 		return out;
 
 	out.active = obs_output_active(primary);
-	out.replay_active = replay_out_ ? obs_output_active(replay_out_) : false;
+	out.replay_active = replay ? obs_output_active(replay) : false;
 	out.total_frames = obs_output_get_total_frames(primary);
 	out.dropped_frames = obs_output_get_frames_dropped(primary);
 	out.total_bytes = obs_output_get_total_bytes(primary);
-	out.encoder_fallback = encoder_fallback_;
+	out.encoder_fallback = fallback;
 
 	uint64_t now_ns = os_gettime_ns();
 	std::lock_guard<std::mutex> slk(stats_mtx_);
@@ -1459,7 +1557,6 @@ SceneSlot::Stats SceneSlot::stats()
 	last_sample_bytes_ = out.total_bytes;
 	out.kbps = last_kbps_;
 
-	// FR-014/FR-011: maintain EWMA of observed kbps for save-time inference.
 	constexpr double alpha = 0.25;
 	if (observed_kbps_ewma_ == 0.0)
 		observed_kbps_ewma_ = last_kbps_;

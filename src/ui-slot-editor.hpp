@@ -30,8 +30,8 @@ private:
     void populate_scene_combo();
     void populate_video_encoder_combo();
     void populate_audio_encoder_combo();
-    void populate_rate_control_combo(); // introspects the selected encoder
-    void update_rc_value_field();       // introspects the value property
+    void populate_rate_control_combo(obs_properties_t* props = nullptr);
+    void update_rc_value_field(obs_properties_t* props = nullptr);
     void update_mp4_warning();          // show/hide MP4 replay warning
 
     // Returns true if enc_id contains the given substring (case-sensitive).
@@ -71,7 +71,7 @@ private:
     // Reads the current venc_combo_ selection, determines encoder family and codec,
     // repopulates encoder_preset_combo_ / encoder_profile_combo_ / encoder_tune_combo_ /
     // multipass_combo_, then shows/hides all encoder-specific widgets.
-    void update_encoder_specific_ui();
+    void update_encoder_specific_ui(obs_properties_t* ext_props = nullptr);
     void update_shared_encoder_visibility();
 
     SceneSlot::Config cfg_;
@@ -150,6 +150,8 @@ private:
     QComboBox*  hevc_tier_combo_         = nullptr;
     QSpinBox*   av1_tile_cols_spin_      = nullptr;
     QSpinBox*   av1_tile_rows_spin_      = nullptr;
+
+    uint64_t cached_avail_mb_ = 0;
 
     // Guards so programmatic combo repopulation doesn't recurse through slots.
     bool loading_ = false;

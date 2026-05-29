@@ -40,6 +40,19 @@ void SlotManager::shutdown()
 // CRUD
 // ----------------------------------------------------------------------------
 
+void SlotManager::rebuild_id_index()
+{
+    id_index_.clear();
+    for (size_t i = 0; i < slots_.size(); ++i)
+        id_index_[slots_[i]->config().id] = i;
+}
+
+SlotManager::SlotSnapshot SlotManager::snapshot_slots() const
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    return {slots_, generation_};  // copies shared_ptrs under mtx_
+}
+
 size_t SlotManager::slot_count() const
 {
     std::lock_guard<std::mutex> lk(mtx_);
@@ -73,11 +86,11 @@ void SlotManager::add_slot(const SceneSlot::Config& cfg)
     bool start_it = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        slots_.emplace_back(std::make_unique<SceneSlot>(cfg));
-        // User-initiated add: the frontend is up, so register hotkeys now.
+        slots_.emplace_back(std::make_shared<SceneSlot>(cfg));
         slots_.back()->register_hotkeys();
         added    = slots_.back().get();
         start_it = started_;
+        rebuild_id_index();
     }
     // start() resolves its group key and owner Config under mtx_ itself
     // (briefly) before acquiring the shared encoder, so it must be called
@@ -100,6 +113,7 @@ void SlotManager::remove_slot(size_t i)
     slots_[i]->stop();
     slots_[i]->unregister_hotkeys();
     slots_.erase(slots_.begin() + i);
+    rebuild_id_index();
 }
 
 void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
@@ -123,37 +137,24 @@ void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
 
 void SlotManager::start_all()
 {
-    std::vector<SceneSlot*> snapshot;
+    std::vector<std::shared_ptr<SceneSlot>> snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         started_ = true;
-        snapshot.reserve(slots_.size());
-        for (auto& s : slots_) snapshot.push_back(s.get());
+        snapshot = slots_;
     }
-    // Single pass; ordering no longer matters because each slot acquires its
-    // shared encoder context independently and an owner need not be running
-    // for a sharing slot to start. start() resolves its group key / owner
-    // Config under mtx_ internally, so it must run OUTSIDE mtx_ (non-
-    // recursive). External contract is unchanged: every slot is started.
-    for (auto* s : snapshot) s->start();
+    for (auto& s : snapshot) s->start();
 }
 
 void SlotManager::stop_all()
 {
-    // F-M1: mirror start_all's snapshot-then-iterate pattern. Each per-slot
-    // s->stop() can block up to ~5s inside SceneSlot::wait_for_output_stop;
-    // holding mtx_ across N stops would freeze every other mtx_ reader (dock
-    // refresh, slot_count, slot_at, ...) for the duration. Snapshot the raw
-    // pointers under mtx_ once, release mtx_, then iterate. Lock order is
-    // unaffected (mtx_ -> slot_mtx_ inside each s->stop()).
-    std::vector<SceneSlot*> snapshot;
+    std::vector<std::shared_ptr<SceneSlot>> snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         started_ = false;
-        snapshot.reserve(slots_.size());
-        for (auto& s : slots_) snapshot.push_back(s.get());
+        snapshot = slots_;
     }
-    for (auto* s : snapshot) s->stop();
+    for (auto& s : snapshot) s->stop();
 }
 
 void SlotManager::register_all_hotkeys()
@@ -171,17 +172,12 @@ void SlotManager::unregister_all_hotkeys()
 bool SlotManager::config_by_slot_id(const std::string& slot_id,
                                     SceneSlot::Config& out) const
 {
-    // Brief: takes mtx_ and releases it before returning so the caller
-    // (SceneSlot::start()) can go on to take shared_mtx_ then slot_mtx_
-    // without ever holding two of them at once.
     std::lock_guard<std::mutex> lk(mtx_);
-    for (auto& s : slots_) {
-        if (s->config().id == slot_id) {
-            out = s->config();   // copy under mtx_
-            return true;
-        }
-    }
-    return false;
+    auto it = id_index_.find(slot_id);
+    if (it == id_index_.end() || it->second >= slots_.size())
+        return false;
+    out = slots_[it->second]->config();
+    return true;
 }
 
 EffectiveRC SlotManager::effective_rate_control(const SceneSlot::Config& c) const
@@ -295,11 +291,10 @@ void SlotManager::release_shared_encoder(const std::string& group_key)
 std::string SlotManager::slot_name_by_id(const std::string& slot_id) const
 {
     std::lock_guard<std::mutex> lk(mtx_);
-    for (auto& s : slots_) {
-        if (s->config().id == slot_id)
-            return s->config().name;
-    }
-    return {};
+    auto it = id_index_.find(slot_id);
+    if (it == id_index_.end() || it->second >= slots_.size())
+        return {};
+    return slots_[it->second]->config().name;
 }
 
 size_t SlotManager::generation() const
@@ -406,8 +401,8 @@ static SceneSlot::Config slot_from_data(obs_data_t* d)
     if (c.audio_tracks == 0)  c.audio_tracks = 0x01;
     if (c.width == 0)         c.width = 1920;
     if (c.height == 0)        c.height = 1080;
-    if (c.fps_num == 0)       c.fps_num = 60;
-    if (c.fps_den == 0)       c.fps_den = 1;
+    if (c.fps_num == 0 || c.fps_num > 240000) c.fps_num = 60;
+    if (c.fps_den == 0 || c.fps_den > 1001)  c.fps_den = 1;
     if (c.container.empty())  c.container = "mp4";
     if (c.audio_bitrate == 0) c.audio_bitrate = 160;
     if (c.replay_seconds == 0) c.replay_seconds = 30;
@@ -606,7 +601,7 @@ void SlotManager::load_from(obs_data_t* save_data)
         for (size_t i = 0; i < n; ++i) {
             obs_data_t* d = obs_data_array_item(arr, i);
             SceneSlot::Config c = slot_from_data(d);
-            slots_.emplace_back(std::make_unique<SceneSlot>(c));
+            slots_.emplace_back(std::make_shared<SceneSlot>(c));
             // ITEM A: hotkeys are registered later (FINISHED_LOADING /
             // SCENE_COLLECTION_CHANGED), so stash the saved bindings on the
             // new slot now; register_hotkeys() applies+releases them. Each
@@ -647,8 +642,7 @@ void SlotManager::load_from(obs_data_t* save_data)
             }
         }
 
-        // slots_ was rebuilt: invalidate any cached raw SceneSlot* held by
-        // the UI (see SlotManager::generation() / refresh_stats()).
+        rebuild_id_index();
         ++generation_;
     }
     obs_data_array_release(arr);
