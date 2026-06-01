@@ -31,6 +31,13 @@ following section headings as applicable:
 
 ### Fixed
 
+- Multi-track audio recording now correctly produces separate audio streams
+  per selected track. Audio encoders are attached to the output at dense
+  sequential indices (matching how `ffmpeg_muxer` enumerates them) instead
+  of sparse mixer indices, and encoder names include a monotonic epoch to
+  prevent OBS registry collisions across stop/start cycles
+  (`014-fix-multitrack-audio`).
+
 - Hotkey and signal callbacks now hold weak_ptr instead of raw pointers,
   eliminating a potential use-after-free if a slot is removed while a callback
   is in flight (`013-audit-fixes`, S-002).

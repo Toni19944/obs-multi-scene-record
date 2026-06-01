@@ -995,6 +995,9 @@ bool SceneSlot::setup_encoders()
 	// The video encoder belongs to the SharedEncoder context acquired in
 	// start(); this slot only builds its own per-slot audio encoders.
 
+	static std::atomic<uint64_t> encoder_epoch{0};
+	uint64_t epoch = encoder_epoch.fetch_add(1);
+
 	// ---- audio encoders: one per selected OBS track ----
 	audio_t *main_audio = obs_get_audio();
 	if (!main_audio) {
@@ -1011,7 +1014,7 @@ bool SceneSlot::setup_encoders()
 		obs_data_t *as = obs_data_create();
 		obs_data_set_int(as, "bitrate", cfg_.audio_bitrate);
 
-		std::string nm = "aenc_" + cfg_.id + "_t" + std::to_string(track + 1);
+		std::string nm = "aenc_" + cfg_.id + "_e" + std::to_string(epoch) + "_t" + std::to_string(track + 1);
 		obs_encoder_t *aenc =
 			obs_audio_encoder_create(cfg_.audio_encoder_id.c_str(), nm.c_str(), as, (size_t)track, nullptr);
 		obs_data_release(as);
@@ -1019,6 +1022,8 @@ bool SceneSlot::setup_encoders()
 			blog(LOG_ERROR, "[multi-scene-rec] audio encoder create failed for track %d", track + 1);
 			return false;
 		}
+		blog(LOG_DEBUG, "[multi-scene-rec] '%s': created audio encoder '%s' (epoch %llu, track %d)",
+		     cfg_.name.c_str(), nm.c_str(), (unsigned long long)epoch, track + 1);
 		obs_encoder_set_audio(aenc, main_audio);
 		aencs_.push_back(aenc);
 		selected_tracks_.push_back(track); // 0-based OBS track index
@@ -1049,11 +1054,8 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 			return false;
 		}
 		obs_output_set_video_encoder(rec_out_, venc_);
-		// Attach each encoder at the output audio index matching the encoder's
-		// mixer (OBS track) index, not a dense 0..N-1 counter -- otherwise
-		// non-contiguous track selections route to the wrong/empty tracks.
 		for (size_t i = 0; i < aencs_.size(); ++i)
-			obs_output_set_audio_encoder(rec_out_, aencs_[i], (size_t)selected_tracks_[i]);
+			obs_output_set_audio_encoder(rec_out_, aencs_[i], i);
 
 		signal_handler_connect(obs_output_get_signal_handler(rec_out_), "stop", &SceneSlot::on_rec_output_stop,
 				       hotkey_handle_);
@@ -1140,7 +1142,7 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 			} else {
 				obs_output_set_video_encoder(replay_out_, venc_);
 				for (size_t i = 0; i < aencs_.size(); ++i)
-					obs_output_set_audio_encoder(replay_out_, aencs_[i], (size_t)selected_tracks_[i]);
+					obs_output_set_audio_encoder(replay_out_, aencs_[i], i);
 
 				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
 						       &SceneSlot::on_replay_output_stop, hotkey_handle_);
