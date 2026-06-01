@@ -22,6 +22,14 @@ following section headings as applicable:
 
 ## [Unreleased]
 
+### Fixed
+
+- CI builds on all Unix platforms (macOS, Ubuntu) now pass: restored
+  executable permissions (100755) on shell scripts and symlink mode (120000)
+  on `build-aux/run-*` entries that were stripped by Windows git during
+  manual cross-repo copy. Added `.gitattributes` for LF line-ending
+  enforcement (`015-fix-ci-file-permissions`).
+
 ### Added
 
 - Full codebase performance and stability audit report
@@ -30,6 +38,13 @@ following section headings as applicable:
   11 Low. No source code modified (`012-idle-slot-resource-audit`).
 
 ### Fixed
+
+- Multi-track audio recording now correctly produces separate audio streams
+  per selected track. Audio encoders are attached to the output at dense
+  sequential indices (matching how `ffmpeg_muxer` enumerates them) instead
+  of sparse mixer indices, and encoder names include a monotonic epoch to
+  prevent OBS registry collisions across stop/start cycles
+  (`014-fix-multitrack-audio`).
 
 - Hotkey and signal callbacks now hold weak_ptr instead of raw pointers,
   eliminating a potential use-after-free if a slot is removed while a callback

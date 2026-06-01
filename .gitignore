@@ -9,6 +9,7 @@
 !/src
 !.clang-format
 !.gersemirc
+!.gitattributes
 !.gitignore
 !buildspec.json
 !CMakeLists.txt
@@ -16,8 +17,8 @@
 !LICENSE
 !README.md
 !CHANGELOG.md
-!/.specify
-!/specs
+!BUILD.md
+!preview.png
 
 # Keep per-feature test results as gitignored institutional memory
 specs/**/results/
