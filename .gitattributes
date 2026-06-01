@@ -1,0 +1,6 @@
+# Enforce LF line endings for shell scripts on all platforms.
+# Developers adding new shell scripts should add matching rules here.
+*.zsh text eol=lf
+.github/scripts/build-* text eol=lf
+.github/scripts/package-* text eol=lf
+build-aux/run-* text eol=lf
