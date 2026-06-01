@@ -80,3 +80,4 @@ See [BUILD.md](BUILD.md) for full instructions.
   - example with 3 slots:  
   - Without shared encoder: 3 encode passes per frame
   - With shared encoder (slots 2+3 depend on slot 1): 1 encode pass per frame, 3 file writers
+- Claude Code with Spec-Kit was used in the development of this plugin.
