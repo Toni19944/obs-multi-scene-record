@@ -20,7 +20,7 @@ following section headings as applicable:
 - **Performance** — measurable performance/stability improvements with no
   behaviour change.
 
-## [v1.0.5]
+## [Unreleased]
 
 ### Added
 
@@ -201,4 +201,4 @@ following section headings as applicable:
   impossible by construction and giving the user per-file attribution
   from the filename alone (`007-fix-replay-collision`).
 
-[v1.0.5]: https://github.com/Toni19944/obs-multi-scene-record
+[Unreleased]: https://github.com/Toni19944/obs-multi-scene-record
