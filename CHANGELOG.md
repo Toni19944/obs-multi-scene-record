@@ -20,7 +20,6 @@ following section headings as applicable:
 - **Performance** — measurable performance/stability improvements with no
   behaviour change.
 
-## [Unreleased]
 
 ### Added
 
@@ -31,7 +30,7 @@ following section headings as applicable:
 
 ### Fixed
 
-- Multi-track audio recording now correctly produces separate audio streams
+- [v1.0.6] Multi-track audio recording now correctly produces separate audio streams
   per selected track. Audio encoders are attached to the output at dense
   sequential indices (matching how `ffmpeg_muxer` enumerates them) instead
   of sparse mixer indices, and encoder names include a monotonic epoch to
@@ -208,4 +207,4 @@ following section headings as applicable:
   impossible by construction and giving the user per-file attribution
   from the filename alone (`007-fix-replay-collision`).
 
-[Unreleased]: https://github.com/Toni19944/obs-multi-scene-record
+https://github.com/Toni19944/obs-multi-scene-record
