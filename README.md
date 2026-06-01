@@ -5,6 +5,9 @@ An OBS Studio plugin that lets you record and clip from multiple scenes simultan
 ![preview](preview.png)
 
 ---
+## Support:
+If you feel like supporting the development, you can do so via ko-fi:  
+https://ko-fi.com/tonisins
 
 ## Why this exists
 
