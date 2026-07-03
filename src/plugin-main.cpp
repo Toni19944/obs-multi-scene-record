@@ -18,6 +18,17 @@ static MultiSceneRecordDock* g_dock = nullptr;
 
 MultiSceneRecordDock* get_dock() { return g_dock; }
 
+void notify_dock_refresh()
+{
+    obs_queue_task(
+        OBS_TASK_UI,
+        [](void*) {
+            if (auto* dock = get_dock())
+                dock->refresh();
+        },
+        nullptr, false);
+}
+
 // Named (non-lambda) so it can be passed to obs_frontend_remove_event_callback
 // on module unload. A lambda has no stable address to unregister.
 static void dock_create_cb(enum obs_frontend_event event, void*)

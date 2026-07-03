@@ -3,6 +3,7 @@
 #include <QWidget>
 
 #include <cstddef>
+#include <vector>
 
 class QTableWidget;
 class QPushButton;
@@ -59,4 +60,18 @@ private:
     // Last SlotManager generation observed by refresh_stats(); a mismatch
     // means slots_ was rebuilt and cached SceneSlot* are stale.
     size_t last_generation_ = 0;
+
+    // O-001: last-rendered state per row so the 1 Hz stats tick only styles
+    // and resolves owner names on actual transitions. refresh() rebuilds the
+    // cache (and applies the base rendering), so renames, fallback flips and
+    // list changes — which all funnel through refresh() — repaint correctly;
+    // steady-state ticks match the cache and touch nothing.
+    struct RowRenderCache {
+        bool    running      = false;
+        bool    replay_only  = false;
+        QString enc_display;          // base encoder text (no fallback tag)
+        bool    fallback     = false;
+        bool    dropped_warn = false; // orange dropped-frames foreground active
+    };
+    std::vector<RowRenderCache> row_cache_;
 };

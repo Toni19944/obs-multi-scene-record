@@ -20,8 +20,51 @@ following section headings as applicable:
 - **Performance** — measurable performance/stability improvements with no
   behaviour change.
 
-## [Unreleased]
+## [0.7.0]
 
+### Fixed
+
+- Fixed a use-after-free crash window where the 1 Hz statistics refresh or a
+  replay-save log could query an output object being freed by a concurrent
+  stop. All output-state queries outside the slot lock now run on their own
+  held reference (`018-fix-audit-017-findings`, F-001).
+- Recording configuration can no longer be corrupted by applying slot
+  settings from the editor while a record hotkey fires: every start consumes
+  one coherent configuration snapshot taken under the slot lock
+  (`018-fix-audit-017-findings`, F-003).
+- Hotkeys and the dock stay responsive during slot stop, removal and start:
+  the record-hotkey stop is deferred off OBS's hotkey thread, removing a slot
+  no longer holds the manager lock across the output flush, and starting a
+  slot no longer holds the slot lock across encoder/output construction — a
+  failed start cleans up completely with no leak or half-started state
+  (`018-fix-audit-017-findings`, F-002/F-004/F-008).
+- The dock's Edit and Remove dialogs now act on the slot the user chose even
+  if the slot list is rebuilt while the dialog is open — the target is
+  re-resolved by its stable identity, and if it no longer exists a "slots
+  changed" notice appears and nothing is modified
+  (`018-fix-audit-017-findings`, F-005).
+- Eliminated undefined behavior at shutdown: the dock pointer is only touched
+  on the UI thread; cross-thread refresh requests are queued as UI tasks with
+  an in-task null check, so a hotkey during shutdown can no longer touch a
+  dying widget (`018-fix-audit-017-findings`, F-006).
+- Stopping and restarting a slot within the same second can no longer
+  overwrite the finished recording: output filenames are collision-checked at
+  creation time with deterministic `_1`, `_2`, … suffixes (bounded, with a
+  timestamp fallback that never overwrites)
+  (`018-fix-audit-017-findings`, F-007).
+
+### Performance
+
+- Removed recurring hot-path waste: the statistics tick only applies styling
+  and resolves shared-encoder owner names on actual state transitions;
+  loading a scene collection introspects each distinct encoder id once per
+  load pass instead of once per slot; and the replay-buffer size estimate is
+  computed once per start (reusing the shared `popcount32` helper) with
+  byte-identical results (`018-fix-audit-017-findings`,
+  O-001/O-002/O-003).
+
+
+## [OLDER]
 ### Fixed
 
 - CI builds on all Unix platforms (macOS, Ubuntu) now pass: restored
@@ -216,4 +259,4 @@ following section headings as applicable:
   impossible by construction and giving the user per-file attribution
   from the filename alone (`007-fix-replay-collision`).
 
-[Unreleased]: https://github.com/Toni19944/obs-multi-scene-record
+[0.7.0]: https://github.com/Toni19944/obs-multi-scene-record

@@ -102,18 +102,29 @@ void SlotManager::add_slot(const SceneSlot::Config& cfg)
 
 void SlotManager::remove_slot(size_t i)
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    if (i >= slots_.size()) return;
-
+    // F-004: detach under mtx_, stop OUTSIDE it. stop() can block for the
+    // full output flush (up to 5 s on a slow target); holding mtx_ across it
+    // froze every manager consumer — dock repaints, sharing-slot lookups,
+    // persistence. Same detach-under-lock/stop-outside-lock shape as
+    // stop_all(). After the lock is released the slot is undiscoverable
+    // (erased + generation bumped), so sharing-slot lookups during the flush
+    // fail cleanly via the existing not-found paths ("[deleted]").
+    std::shared_ptr<SceneSlot> doomed;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (i >= slots_.size()) return;
+        slots_[i]->unregister_hotkeys();
+        doomed = std::move(slots_[i]);
+        slots_.erase(slots_.begin() + i);
+        ++generation_;
+        rebuild_id_index();
+    }
     // Stopping this slot no longer cascades to other slots: a sharing slot
     // keeps its own reference to the shared encoder context, which survives
-    // until its own last consumer releases. stop() -> teardown_locked() ->
-    // release_shared_encoder() takes slot_mtx_ then shared_mtx_ (leaf),
-    // preserving mtx_ -> slot_mtx_ -> shared_mtx_.
-    slots_[i]->stop();
-    slots_[i]->unregister_hotkeys();
-    slots_.erase(slots_.begin() + i);
-    rebuild_id_index();
+    // until its own last consumer releases. stop() -> teardown() ->
+    // release_shared_encoder() takes slot_mtx_ then shared_mtx_ (leaf) with
+    // mtx_ already released — no lock-order change.
+    doomed->stop();
 }
 
 void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
@@ -129,6 +140,45 @@ void SlotManager::update_slot(size_t i, const SceneSlot::Config& cfg)
     // WITHOUT holding mtx_ (non-recursive). The acquire path replaces the
     // former pre-resolved encoder argument entirely.
     s->update_config(cfg);
+}
+
+bool SlotManager::update_slot_by_id(const std::string& slot_id, const SceneSlot::Config& cfg)
+{
+    // F-005: resolve id -> slot atomically under mtx_; a stale row index
+    // from before a modal dialog can never redirect the update. The
+    // shared_ptr keeps the resolved slot alive across the unlocked
+    // update_config call (which may stop() + start(), so it must run
+    // without mtx_ held — see update_slot above).
+    std::shared_ptr<SceneSlot> s;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = id_index_.find(slot_id);
+        if (it == id_index_.end() || it->second >= slots_.size()) return false;
+        s = slots_[it->second];
+    }
+    s->update_config(cfg);
+    return true;
+}
+
+bool SlotManager::remove_slot_by_id(const std::string& slot_id)
+{
+    // F-005 + F-004: resolve id -> index and detach atomically under mtx_,
+    // then flush outside the lock — same detach-then-stop shape as
+    // remove_slot(size_t).
+    std::shared_ptr<SceneSlot> doomed;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto it = id_index_.find(slot_id);
+        if (it == id_index_.end() || it->second >= slots_.size()) return false;
+        const size_t i = it->second;
+        slots_[i]->unregister_hotkeys();
+        doomed = std::move(slots_[i]);
+        slots_.erase(slots_.begin() + i);
+        ++generation_;
+        rebuild_id_index();
+    }
+    doomed->stop();
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -365,7 +415,13 @@ static obs_data_t* slot_to_data(const SceneSlot::Config& c)
     return d;
 }
 
-static SceneSlot::Config slot_from_data(obs_data_t* d)
+// O-002: `props_cache` is a per-load-pass memo (owned by load_from's stack)
+// mapping encoder id -> introspected properties, so N slots sharing one
+// encoder id cost ONE obs_get_encoder_properties call instead of N. Null
+// results are cached too (unknown encoder id stays one lookup). Entries are
+// destroyed by load_from when the pass ends; validation logic is untouched.
+static SceneSlot::Config slot_from_data(obs_data_t* d,
+                                        std::unordered_map<std::string, obs_properties_t*>& props_cache)
 {
     SceneSlot::Config c;
     c.id              = obs_data_get_string(d, "id");
@@ -423,11 +479,18 @@ static SceneSlot::Config slot_from_data(obs_data_t* d)
         // Standalone slot: introspect the selected encoder once and validate
         // the persisted mode + value. Same property-accessor pattern the
         // editor uses, so the editor's range source and the load-time clamp
-        // source agree by construction.
-        obs_properties_t* props =
-            c.video_encoder_id.empty()
-                ? nullptr
-                : obs_get_encoder_properties(c.video_encoder_id.c_str());
+        // source agree by construction. O-002: the cache owns the properties;
+        // a hit skips the (expensive) introspection entirely.
+        obs_properties_t* props = nullptr;
+        if (!c.video_encoder_id.empty()) {
+            auto cached = props_cache.find(c.video_encoder_id);
+            if (cached != props_cache.end()) {
+                props = cached->second;
+            } else {
+                props = obs_get_encoder_properties(c.video_encoder_id.c_str());
+                props_cache.emplace(c.video_encoder_id, props);
+            }
+        }
         if (props) {
             // T011 / Decision 4 / FR-015 — mode-substitute-and-warn.
             obs_property_t* rc_prop = obs_properties_get(props, "rate_control");
@@ -488,7 +551,8 @@ static SceneSlot::Config slot_from_data(obs_data_t* d)
                     }
                 }
             }
-            obs_properties_destroy(props);
+            // O-002: no obs_properties_destroy here — the cache owns props;
+            // load_from destroys every cached entry when the pass ends.
         }
     }
 
@@ -598,9 +662,14 @@ void SlotManager::load_from(obs_data_t* save_data)
         std::lock_guard<std::mutex> lk(mtx_);
         slots_.clear();
         size_t n = obs_data_array_count(arr);
+        // O-002: per-load-pass encoder introspection cache. slot_from_data
+        // fills it on first sight of each encoder id and reuses it for every
+        // later slot in this pass; all entries are destroyed right after the
+        // loop so nothing outlives the pass.
+        std::unordered_map<std::string, obs_properties_t*> props_cache;
         for (size_t i = 0; i < n; ++i) {
             obs_data_t* d = obs_data_array_item(arr, i);
-            SceneSlot::Config c = slot_from_data(d);
+            SceneSlot::Config c = slot_from_data(d, props_cache);
             slots_.emplace_back(std::make_shared<SceneSlot>(c));
             // ITEM A: hotkeys are registered later (FINISHED_LOADING /
             // SCENE_COLLECTION_CHANGED), so stash the saved bindings on the
@@ -614,6 +683,13 @@ void SlotManager::load_from(obs_data_t* save_data)
             slots_.back()->set_pending_hotkey_bindings(hkr, hkp);
             obs_data_release(d);
         }
+
+        // O-002: the pass is over — destroy every cached introspection
+        // result (null entries recorded for unknown encoder ids are no-ops).
+        for (auto& entry : props_cache)
+            if (entry.second)
+                obs_properties_destroy(entry.second);
+        props_cache.clear();
 
         // T010b — orphan-consumer warning: any consumer whose
         // shared_encoder_slot_id does NOT resolve to a sibling owner is left

@@ -139,9 +139,19 @@ uint64_t available_physical_mb()
 }
 
 uint64_t resolve_max_size_mb(const SceneSlot::Config &cfg, const EffectiveRC &eff,
-                             bool *out_was_clamped, uint64_t *out_requested_mb)
+                             bool *out_was_clamped, uint64_t *out_requested_mb,
+                             uint64_t *out_auto_mb, uint32_t *out_assumed_kbps)
 {
-	uint64_t auto_mb = auto_derived_max_size_mb(cfg, eff);
+	// O-003: compute the estimate chain ONCE and surface the intermediate
+	// values callers previously recomputed (auto-derived MB, assumed kbps).
+	// auto_mb uses the exact auto_derived_max_size_mb formula, so results
+	// are byte-identical to the former triple computation.
+	uint64_t est_kbps = estimated_kbps(cfg, eff);
+	uint64_t auto_mb = est_kbps * cfg.replay_seconds * 2 / (8 * 1024);
+	if (out_auto_mb)
+		*out_auto_mb = auto_mb;
+	if (out_assumed_kbps)
+		*out_assumed_kbps = (uint32_t)est_kbps;
 	uint64_t requested_mb = (cfg.replay_max_size_mb > 0) ? cfg.replay_max_size_mb : auto_mb;
 	if (out_requested_mb)
 		*out_requested_mb = requested_mb;
@@ -317,9 +327,22 @@ std::string build_output_filename(const SceneSlot::Config &cfg)
 	path += id6;
 	path += '_';
 	path += ts;
-	path += '.';
-	path += cfg.container.empty() ? std::string("mp4") : cfg.container;
-	return path;
+
+	const std::string ext = cfg.container.empty() ? std::string("mp4") : cfg.container;
+
+	// F-007: the timestamp only has one-second resolution, so a stop+restart
+	// inside the same second would silently overwrite the finished file.
+	// Probe deterministically: base name first, then _1, _2, ... suffixes
+	// before the extension until a free name is found (a pre-existing _N on
+	// disk is simply skipped past). Bounded; the epoch-ns fallback can
+	// realistically never collide, so nothing is ever overwritten.
+	std::string candidate = path + '.' + ext;
+	static constexpr int kMaxSuffixProbes = 1000;
+	for (int i = 1; os_file_exists(candidate.c_str()) && i <= kMaxSuffixProbes; ++i)
+		candidate = path + '_' + std::to_string(i) + '.' + ext;
+	if (os_file_exists(candidate.c_str()))
+		candidate = path + '_' + std::to_string((unsigned long long)os_gettime_ns()) + '.' + ext;
+	return candidate;
 }
 
 // Write the quality value into whichever quality-named setting the encoder
@@ -669,33 +692,64 @@ bool SceneSlot::start()
 	if (!running_.compare_exchange_strong(expected, true))
 		return true;
 
-	// ---- Resolve the encoder-group key and a COPY of the owner Config
-	//      BEFORE taking slot_mtx_. For a sharing slot this looks up the
-	//      referenced slot's Config via SlotManager (mtx_ taken briefly and
-	//      released inside config_by_slot_id), mirroring the former
-	//      pre-slot_mtx_ resolution. Lock order is mtx_ -> slot_mtx_, and
+	// ---- Phase 1 (F-003, short slot_mtx_ hold): normalize cfg_ (written
+	//      back so behavior/persistence is unchanged) and copy ONE coherent
+	//      snapshot. Everything below reads the snapshot, never cfg_ — an
+	//      update_config racing this start can no longer produce a torn mix
+	//      of old and new values. The epoch tags this start attempt so the
+	//      commit below can detect being superseded by a stop()+start()
+	//      that ran while the pipeline was being built unlocked (F-008). ----
+	Config snapshot;
+	uint64_t my_epoch;
+	{
+		std::lock_guard<std::mutex> pre_lk(slot_mtx_);
+		if (cfg_.audio_tracks == 0) {
+			blog(LOG_WARNING, "[multi-scene-rec] '%s': no audio tracks selected; defaulting to track 1",
+			     cfg_.name.c_str());
+			cfg_.audio_tracks = 0x01;
+		}
+		// replay-only is meaningless without the replay buffer; enforce it.
+		if (cfg_.replay_only && !cfg_.replay_enabled) {
+			blog(LOG_WARNING, "[multi-scene-rec] '%s': replay-only set but replay disabled; enabling replay",
+			     cfg_.name.c_str());
+			cfg_.replay_enabled = true;
+		}
+		snapshot = cfg_;
+		my_epoch = ++start_epoch_;
+	}
+
+	// ---- Resolve the encoder-group key and a COPY of the owner Config from
+	//      the snapshot. For a sharing slot this looks up the referenced
+	//      slot's Config via SlotManager (mtx_ taken briefly and released
+	//      inside config_by_slot_id). Lock order is mtx_ -> slot_mtx_, and
 	//      acquire_shared_encoder (shared_mtx_, leaf) must run with neither
 	//      mtx_ nor slot_mtx_ held. ----
 	std::string group_key;
 	SceneSlot::Config owner_cfg;
-	{
-		std::lock_guard<std::mutex> pre_lk(slot_mtx_);
-		const std::string dep_id = cfg_.shared_encoder_slot_id;
-		if (!dep_id.empty()) {
-			group_key = dep_id;
-		} else {
-			group_key = cfg_.id;
-			owner_cfg = cfg_;
-		}
-	}
-	if (!group_key.empty() && owner_cfg.id.empty()) {
+	if (!snapshot.shared_encoder_slot_id.empty()) {
+		group_key = snapshot.shared_encoder_slot_id;
 		if (!SlotManager::instance().config_by_slot_id(group_key, owner_cfg)) {
-			std::lock_guard<std::mutex> pre_lk(slot_mtx_);
 			blog(LOG_ERROR, "[multi-scene-rec] '%s': encoder source slot '%s' not found",
-			     cfg_.name.c_str(), group_key.c_str());
+			     snapshot.name.c_str(), group_key.c_str());
 			running_.store(false);
 			return false;
 		}
+	} else {
+		group_key = snapshot.id;
+		owner_cfg = snapshot;
+	}
+
+	// Validate before acquiring anything so these failures need no cleanup.
+	if (snapshot.path.empty()) {
+		blog(LOG_ERROR, "[multi-scene-rec] '%s': output path is empty", snapshot.name.c_str());
+		running_.store(false);
+		return false;
+	}
+	if (!os_file_exists(snapshot.path.c_str())) {
+		blog(LOG_ERROR, "[multi-scene-rec] '%s': output path does not exist: %s", snapshot.name.c_str(),
+		     snapshot.path.c_str());
+		running_.store(false);
+		return false;
 	}
 
 	// Acquire (or build) the shared encoder context for this group. Takes
@@ -703,111 +757,128 @@ bool SceneSlot::start()
 	SharedEncoder *shared = SlotManager::instance().acquire_shared_encoder(group_key, owner_cfg);
 	if (!shared) {
 		blog(LOG_ERROR, "[multi-scene-rec] '%s': could not acquire shared encoder (group '%s')",
-		     cfg_.name.c_str(), group_key.c_str());
+		     snapshot.name.c_str(), group_key.c_str());
 		running_.store(false);
 		return false;
 	}
+	// Both fields are fixed for the context's lifetime and we hold a
+	// consumption ref, so reading them without shared_mtx_ is safe (same
+	// guarantee the previous under-slot_mtx_ read relied on).
+	obs_encoder_t *shared_venc = shared->venc_;
+	const bool shared_fallback = shared->encoder_fallback_;
 
-	// Resolve effective rate-control BEFORE taking slot_mtx_. The helper
+	// Resolve effective rate-control with NO plugin lock held. The helper
 	// internally takes mtx_ then shared_mtx_ (independently), so calling it
-	// while holding slot_mtx_ would invert the global order mtx_ ->
-	// slot_mtx_. Stash for the log emit and pass to setup_outputs (T006/T007).
-	const EffectiveRC eff_rc = SlotManager::instance().effective_rate_control(cfg_);
+	// under slot_mtx_ would invert the global order mtx_ -> slot_mtx_.
+	const EffectiveRC eff_rc = SlotManager::instance().effective_rate_control(snapshot);
 
-	// slot_mtx_ guards all per-slot members written below (outputs, audio
-	// encoders, group_key_/venc_, cfg_). Held for the rest of start(). The
-	// atomic CAS above remains the fast early-out.
-	std::lock_guard<std::mutex> lk(slot_mtx_);
+	// ---- Phase 2 (F-008, UNLOCKED): build the whole pipeline into locals
+	//      and start it. slot_mtx_ is NOT held across encoder/output
+	//      construction or obs_output_start, so stats() and the replay-save
+	//      hotkey never stall behind a slow disk or encoder. On failure the
+	//      locals are torn down right here — the members were never touched,
+	//      so concurrent readers only ever see "not started". ----
+	std::vector<obs_encoder_t *> local_aencs;
+	std::vector<int> local_tracks;
+	obs_output_t *local_rec = nullptr;
+	obs_output_t *local_replay = nullptr;
+	ReplaySizing sizing;
+	uint64_t started_ns = 0;
 
-	// Record what we are consuming so teardown_locked() releases the right
-	// context. venc_ is a borrowed pointer (a strong ref is held on our
-	// behalf by acquire_shared_encoder, dropped by release_shared_encoder).
-	group_key_ = group_key;
-	venc_ = shared->venc_;
-	encoder_fallback_ = shared->encoder_fallback_; // local copy for stats()
-
-	if (cfg_.audio_tracks == 0) {
-		blog(LOG_WARNING, "[multi-scene-rec] '%s': no audio tracks selected; defaulting to track 1",
-		     cfg_.name.c_str());
-		cfg_.audio_tracks = 0x01;
+	bool ok = setup_encoders(snapshot, local_aencs, local_tracks);
+	if (ok && !shared_venc) {
+		blog(LOG_ERROR, "[multi-scene-rec] '%s': no video encoder available", snapshot.name.c_str());
+		ok = false;
 	}
+	if (ok)
+		ok = setup_outputs(snapshot, eff_rc, shared_venc, local_aencs, &local_rec, &local_replay, &sizing);
 
-	// replay-only is meaningless without the replay buffer; enforce it.
-	if (cfg_.replay_only && !cfg_.replay_enabled) {
-		blog(LOG_WARNING, "[multi-scene-rec] '%s': replay-only set but replay disabled; enabling replay",
-		     cfg_.name.c_str());
-		cfg_.replay_enabled = true;
+	if (ok) {
+		started_ns = os_gettime_ns();
+		// Recording output is absent in replay-only mode.
+		if (local_rec && !obs_output_start(local_rec)) {
+			blog(LOG_ERROR, "[multi-scene-rec] '%s' rec start failed: %s", snapshot.name.c_str(),
+			     obs_output_get_last_error(local_rec));
+			ok = false;
+		}
 	}
-
-	// The shared context is already acquired, so failures from here on must
-	// go through teardown_locked() to release it (and any per-slot state).
-	if (cfg_.path.empty()) {
-		blog(LOG_ERROR, "[multi-scene-rec] '%s': output path is empty", cfg_.name.c_str());
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-	if (!os_file_exists(cfg_.path.c_str())) {
-		blog(LOG_ERROR, "[multi-scene-rec] '%s': output path does not exist: %s", cfg_.name.c_str(),
-		     cfg_.path.c_str());
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-
-	if (!setup_encoders()) {
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-
-	if (!venc_) {
-		blog(LOG_ERROR, "[multi-scene-rec] '%s': no video encoder available", cfg_.name.c_str());
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-
-	if (!setup_outputs(eff_rc)) {
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-
-	start_time_ns_.store(os_gettime_ns(), std::memory_order_release);
-
-	// Recording output is absent in replay-only mode.
-	if (rec_out_ && !obs_output_start(rec_out_)) {
-		blog(LOG_ERROR, "[multi-scene-rec] '%s' rec start failed: %s", cfg_.name.c_str(),
-		     obs_output_get_last_error(rec_out_));
-		running_.store(false);
-		teardown_locked();
-		return false;
-	}
-	if (replay_out_ && !obs_output_start(replay_out_)) {
-		blog(LOG_WARNING, "[multi-scene-rec] '%s' replay start failed: %s", cfg_.name.c_str(),
-		     obs_output_get_last_error(replay_out_));
-		obs_output_release(replay_out_);
-		replay_out_ = nullptr;
-		if (cfg_.replay_only) {
+	if (ok && local_replay && !obs_output_start(local_replay)) {
+		blog(LOG_WARNING, "[multi-scene-rec] '%s' replay start failed: %s", snapshot.name.c_str(),
+		     obs_output_get_last_error(local_replay));
+		obs_output_release(local_replay);
+		local_replay = nullptr;
+		if (snapshot.replay_only) {
 			// The replay buffer was the only output -- nothing left to run.
 			blog(LOG_ERROR, "[multi-scene-rec] '%s' replay-only but replay failed to start",
-			     cfg_.name.c_str());
-			running_.store(false);
-			teardown_locked();
-			return false;
+			     snapshot.name.c_str());
+			ok = false;
 		}
+	}
+
+	// ---- Phase 3 (short slot_mtx_ re-acquire): commit the complete
+	//      pipeline into the members. The epoch check catches a stop() (or
+	//      stop()+start()) that ran during the unlocked build: in that case
+	//      this attempt is stale and must discard its locals instead of
+	//      committing a ghost pipeline over the superseding owner's state.
+	//      running_ is left alone on that path — the superseding start()
+	//      owns it now. ----
+	bool committed = false;
+	if (ok) {
+		std::lock_guard<std::mutex> lk(slot_mtx_);
+		if (start_epoch_ == my_epoch && running_.load()) {
+			group_key_ = group_key;
+			venc_ = shared_venc;
+			encoder_fallback_ = shared_fallback; // local copy for stats()
+			aencs_ = std::move(local_aencs);
+			selected_tracks_ = std::move(local_tracks);
+			rec_out_ = local_rec;
+			replay_out_ = local_replay;
+			start_time_ns_.store(started_ns, std::memory_order_release);
+			resolved_max_size_mb_.store(sizing.resolved_mb, std::memory_order_release);
+			was_clamped_at_start_.store(sizing.was_clamped, std::memory_order_release);
+			replay_seconds_at_start_.store(sizing.replay_seconds, std::memory_order_release);
+			assumed_kbps_at_start_.store(sizing.assumed_kbps, std::memory_order_release);
+			committed = true;
+		}
+	}
+
+	if (!committed) {
+		// Failure or superseded: tear the locals down directly. Mirrors
+		// teardown()'s order (disconnect, stop, wait, release) without
+		// touching any member — readers never saw this pipeline.
+		if (local_rec) {
+			signal_handler_disconnect(obs_output_get_signal_handler(local_rec), "stop",
+						  &SceneSlot::on_rec_output_stop, hotkey_handle_);
+			obs_output_stop(local_rec);
+			wait_for_output_stop(local_rec, snapshot.name);
+			obs_output_release(local_rec);
+		}
+		if (local_replay) {
+			signal_handler_disconnect(obs_output_get_signal_handler(local_replay), "saved",
+						  &SceneSlot::on_replay_saved, hotkey_handle_);
+			signal_handler_disconnect(obs_output_get_signal_handler(local_replay), "stop",
+						  &SceneSlot::on_replay_output_stop, hotkey_handle_);
+			obs_output_stop(local_replay);
+			wait_for_output_stop(local_replay, snapshot.name);
+			obs_output_release(local_replay);
+		}
+		for (auto *aenc : local_aencs)
+			if (aenc)
+				obs_encoder_release(aenc);
+		SlotManager::instance().release_shared_encoder(group_key);
+		if (!ok)
+			running_.store(false);
+		return false;
 	}
 
 	// F-S1: no running_.store(true) here -- the CAS at the top of start()
 	// already set running_=true, and every failure path between resets it
-	// to false via running_.store(false); teardown_locked(); return false;
-	// before reaching this point.
+	// to false (or leaves it to the superseding start) before this point.
 
 	char tracks_str[16] = {0};
 	int pos = 0;
 	for (int i = 0; i < 6; ++i)
-		if (cfg_.audio_tracks & (1u << i))
+		if (snapshot.audio_tracks & (1u << i))
 			pos += std::snprintf(tracks_str + pos, sizeof(tracks_str) - pos, "%s%d", pos ? "," : "", i + 1);
 
 	// Rate-control segment: Lossless prints no numeric value; bitrate/quality
@@ -821,11 +892,11 @@ bool SceneSlot::start()
 			      eff_rc.mode.c_str(), eff_rc.value);
 
 	const bool inherited = !eff_rc.owner_slot_name.empty();
-	blog(LOG_INFO, "[multi-scene-rec] '%s' started (%ux%u@%u, %s, tracks=%s, %s)%s%s%s", cfg_.name.c_str(),
-	     cfg_.width, cfg_.height, cfg_.fps_num, rc_buf, tracks_str,
-	     cfg_.replay_only      ? "replay-only"
-	     : cfg_.replay_enabled ? "rec+replay"
-				   : "rec-only",
+	blog(LOG_INFO, "[multi-scene-rec] '%s' started (%ux%u@%u, %s, tracks=%s, %s)%s%s%s", snapshot.name.c_str(),
+	     snapshot.width, snapshot.height, snapshot.fps_num, rc_buf, tracks_str,
+	     snapshot.replay_only      ? "replay-only"
+	     : snapshot.replay_enabled ? "rec+replay"
+				       : "rec-only",
 	     inherited ? " inherited from '" : "", inherited ? eff_rc.owner_slot_name.c_str() : "",
 	     inherited ? "'" : "");
 	return true;
@@ -842,8 +913,10 @@ void SceneSlot::teardown()
 {
 	obs_output_t *local_rec = nullptr;
 	obs_output_t *local_replay = nullptr;
+	std::string name;
 	{
 		std::lock_guard<std::mutex> lk(slot_mtx_);
+		name = cfg_.name; // F-003: captured under the lock for the unlocked wait below
 		if (rec_out_) {
 			signal_handler_disconnect(obs_output_get_signal_handler(rec_out_), "stop",
 						  &SceneSlot::on_rec_output_stop, hotkey_handle_);
@@ -861,8 +934,8 @@ void SceneSlot::teardown()
 		rec_out_ = nullptr;
 		replay_out_ = nullptr;
 	}
-	wait_for_output_stop(local_rec);
-	wait_for_output_stop(local_replay);
+	wait_for_output_stop(local_rec, name);
+	wait_for_output_stop(local_replay, name);
 	{
 		std::lock_guard<std::mutex> lk(slot_mtx_);
 		if (local_rec)
@@ -892,8 +965,11 @@ void SceneSlot::teardown()
 	}
 }
 
-void SceneSlot::wait_for_output_stop(obs_output_t *out)
+void SceneSlot::wait_for_output_stop(obs_output_t *out, const std::string &name)
 {
+	// F-003: the slot name is passed in (captured under slot_mtx_ by the
+	// caller) because this runs without the lock — reading cfg_.name here
+	// would race update_config.
 	if (!out)
 		return;
 	static constexpr int kStopTimeoutMs = 5000;
@@ -905,84 +981,8 @@ void SceneSlot::wait_for_output_stop(obs_output_t *out)
 		++iters;
 	}
 	if (obs_output_active(out)) {
-		blog(LOG_WARNING, "[multi-scene-rec] '%s': output did not stop within 5s; forcing", cfg_.name.c_str());
+		blog(LOG_WARNING, "[multi-scene-rec] '%s': output did not stop within 5s; forcing", name.c_str());
 		obs_output_force_stop(out);
-	}
-}
-
-// Safe teardown order (caller holds slot_mtx_):
-//   a. request stop on both outputs (after disconnecting their stop signal so
-//      the handler does not re-enter a half-destroyed slot)
-//   b. wait for each output's async stop to actually complete
-//   c. release the outputs
-//   d. release the per-slot audio encoders
-//   e. release this slot's reference to the shared video-encoder context
-//      (SlotManager destroys scene/view/video/encoder only when the LAST
-//      consumer releases — stopping this slot never tears down a sibling's
-//      pipeline)
-void SceneSlot::teardown_locked()
-{
-	// Note: hotkeys are intentionally NOT touched here. Their lifecycle is
-	// owned by SlotManager so the record-toggle hotkey survives stop().
-
-	// (a) Disconnect stop-signal handlers, then request stop on both outputs.
-	if (rec_out_) {
-		signal_handler_disconnect(obs_output_get_signal_handler(rec_out_), "stop",
-					  &SceneSlot::on_rec_output_stop, hotkey_handle_);
-		obs_output_stop(rec_out_);
-	}
-	if (replay_out_) {
-		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "saved",
-					  &SceneSlot::on_replay_saved, hotkey_handle_);
-		signal_handler_disconnect(obs_output_get_signal_handler(replay_out_), "stop",
-					  &SceneSlot::on_replay_output_stop, hotkey_handle_);
-		obs_output_stop(replay_out_);
-	}
-
-	// (b) Wait for the async stop to actually finish on each output.
-	wait_for_output_stop(rec_out_);
-	wait_for_output_stop(replay_out_);
-
-	// (c) Release the outputs.
-	if (rec_out_) {
-		obs_output_release(rec_out_);
-		rec_out_ = nullptr;
-	}
-	if (replay_out_) {
-		obs_output_release(replay_out_);
-		replay_out_ = nullptr;
-	}
-
-	// (d) Release the per-slot audio encoders.
-	for (auto *aenc : aencs_)
-		if (aenc)
-			obs_encoder_release(aenc);
-	aencs_.clear();
-	selected_tracks_.clear();
-
-	// (e) Release this slot's reference to the shared video-encoder context.
-	//     release_shared_encoder() drops the strong ref taken by
-	//     acquire_shared_encoder() and decrements the group's use-count; the
-	//     context (and its scene/view/video/encoder) is destroyed in the
-	//     mandatory encoder->view->scene order ONLY when the last consumer
-	//     releases. shared_mtx_ is a strict LEAF, so calling this while
-	//     holding slot_mtx_ does not invert the lock order. venc_ is non-null
-	//     only after a successful acquire in start().
-	if (venc_) {
-		SlotManager::instance().release_shared_encoder(group_key_);
-		venc_ = nullptr;
-	}
-	group_key_.clear();
-	encoder_fallback_ = false;
-
-	start_time_ns_.store(0, std::memory_order_release);
-	resolved_max_size_mb_.store(0, std::memory_order_release);
-	was_clamped_at_start_.store(false, std::memory_order_release);
-	replay_seconds_at_start_.store(0, std::memory_order_release);
-	assumed_kbps_at_start_.store(0, std::memory_order_release);
-	{
-		std::lock_guard<std::mutex> slk(stats_mtx_);
-		observed_kbps_ewma_ = 0.0;
 	}
 }
 
@@ -990,10 +990,14 @@ void SceneSlot::teardown_locked()
 // encoders (audio only — the video encoder lives in the shared context)
 // =============================================================================
 
-bool SceneSlot::setup_encoders()
+bool SceneSlot::setup_encoders(const Config &cfg, std::vector<obs_encoder_t *> &aencs, std::vector<int> &tracks)
 {
 	// The video encoder belongs to the SharedEncoder context acquired in
 	// start(); this slot only builds its own per-slot audio encoders.
+	// F-008: runs UNLOCKED on start()'s config snapshot, building into the
+	// caller's locals — members are only touched by start()'s commit phase.
+	// A mid-loop failure leaves the encoders created so far in `aencs`;
+	// the caller's failure path releases them.
 
 	static std::atomic<uint64_t> encoder_epoch{0};
 	uint64_t epoch = encoder_epoch.fetch_add(1);
@@ -1005,30 +1009,30 @@ bool SceneSlot::setup_encoders()
 		return false;
 	}
 
-	aencs_.clear();
-	selected_tracks_.clear();
+	aencs.clear();
+	tracks.clear();
 	for (int track = 0; track < 6; ++track) {
-		if ((cfg_.audio_tracks & (1u << track)) == 0)
+		if ((cfg.audio_tracks & (1u << track)) == 0)
 			continue;
 
 		obs_data_t *as = obs_data_create();
-		obs_data_set_int(as, "bitrate", cfg_.audio_bitrate);
+		obs_data_set_int(as, "bitrate", cfg.audio_bitrate);
 
-		std::string nm = "aenc_" + cfg_.id + "_e" + std::to_string(epoch) + "_t" + std::to_string(track + 1);
+		std::string nm = "aenc_" + cfg.id + "_e" + std::to_string(epoch) + "_t" + std::to_string(track + 1);
 		obs_encoder_t *aenc =
-			obs_audio_encoder_create(cfg_.audio_encoder_id.c_str(), nm.c_str(), as, (size_t)track, nullptr);
+			obs_audio_encoder_create(cfg.audio_encoder_id.c_str(), nm.c_str(), as, (size_t)track, nullptr);
 		obs_data_release(as);
 		if (!aenc) {
 			blog(LOG_ERROR, "[multi-scene-rec] audio encoder create failed for track %d", track + 1);
 			return false;
 		}
 		blog(LOG_DEBUG, "[multi-scene-rec] '%s': created audio encoder '%s' (epoch %llu, track %d)",
-		     cfg_.name.c_str(), nm.c_str(), (unsigned long long)epoch, track + 1);
+		     cfg.name.c_str(), nm.c_str(), (unsigned long long)epoch, track + 1);
 		obs_encoder_set_audio(aenc, main_audio);
-		aencs_.push_back(aenc);
-		selected_tracks_.push_back(track); // 0-based OBS track index
+		aencs.push_back(aenc);
+		tracks.push_back(track); // 0-based OBS track index
 	}
-	if (aencs_.empty()) {
+	if (aencs.empty()) {
 		blog(LOG_ERROR, "[multi-scene-rec] no audio encoders created");
 		return false;
 	}
@@ -1039,34 +1043,49 @@ bool SceneSlot::setup_encoders()
 // outputs
 // =============================================================================
 
-bool SceneSlot::setup_outputs(const EffectiveRC &eff)
+bool SceneSlot::setup_outputs(const Config &cfg, const EffectiveRC &eff, obs_encoder_t *venc,
+			      const std::vector<obs_encoder_t *> &aencs, obs_output_t **out_rec,
+			      obs_output_t **out_replay, ReplaySizing *sizing)
 {
+	// F-008: runs UNLOCKED on start()'s config snapshot. Outputs are handed
+	// back through out_rec/out_replay (assigned as soon as they exist so the
+	// caller's failure path can release them); replay sizing telemetry goes
+	// through `sizing` and reaches the atomics only in start()'s commit.
+	obs_output_t *rec = nullptr;
+	obs_output_t *replay = nullptr;
+
 	// ---- recording (ffmpeg_muxer) -- skipped entirely in replay-only mode ----
-	if (!cfg_.replay_only) {
+	if (!cfg.replay_only) {
 		obs_data_t *rs = obs_data_create();
-		obs_data_set_string(rs, "path", build_output_filename(cfg_).c_str());
+		obs_data_set_string(rs, "path", build_output_filename(cfg).c_str());
 		obs_data_set_string(rs, "muxer_settings", "");
 
-		rec_out_ = obs_output_create("ffmpeg_muxer", ("rec_out_" + cfg_.id).c_str(), rs, nullptr);
+		rec = obs_output_create("ffmpeg_muxer", ("rec_out_" + cfg.id).c_str(), rs, nullptr);
 		obs_data_release(rs);
-		if (!rec_out_) {
+		if (!rec) {
 			blog(LOG_ERROR, "[multi-scene-rec] rec output create failed");
 			return false;
 		}
-		obs_output_set_video_encoder(rec_out_, venc_);
-		for (size_t i = 0; i < aencs_.size(); ++i)
-			obs_output_set_audio_encoder(rec_out_, aencs_[i], i);
+		*out_rec = rec;
+		obs_output_set_video_encoder(rec, venc);
+		for (size_t i = 0; i < aencs.size(); ++i)
+			obs_output_set_audio_encoder(rec, aencs[i], i);
 
-		signal_handler_connect(obs_output_get_signal_handler(rec_out_), "stop", &SceneSlot::on_rec_output_stop,
+		signal_handler_connect(obs_output_get_signal_handler(rec), "stop", &SceneSlot::on_rec_output_stop,
 				       hotkey_handle_);
 	}
 
 	// ---- replay buffer (optional) ----
-	if (cfg_.replay_enabled) {
+	if (cfg.replay_enabled) {
 		bool was_clamped = false;
 		uint64_t requested_mb = 0;
+		uint64_t auto_mb = 0;
+		uint32_t assumed_kbps = 0;
+		// O-003: one call resolves the cap AND returns the auto-derived MB
+		// and assumed kbps it computes internally, so the estimate chain
+		// runs exactly once per start (values identical by construction).
 		uint64_t resolved_mb = replay_buffer_util::resolve_max_size_mb(
-			cfg_, eff, &was_clamped, &requested_mb);
+			cfg, eff, &was_clamped, &requested_mb, &auto_mb, &assumed_kbps);
 
 		if (resolved_mb == 0) {
 			blog(LOG_ERROR,
@@ -1076,23 +1095,13 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 			     "without a replay buffer. Remedies: set 'Max replay buffer size (MB)' "
 			     "smaller, lower replay duration, lower quality, or switch to a "
 			     "bitrate-based rate-control mode.",
-			     cfg_.name.c_str(),
+			     cfg.name.c_str(),
 			     (unsigned long long)replay_buffer_util::available_physical_mb());
 		} else {
-			resolved_max_size_mb_.store(resolved_mb, std::memory_order_release);
-			was_clamped_at_start_.store(was_clamped, std::memory_order_release);
-			replay_seconds_at_start_.store(cfg_.replay_seconds, std::memory_order_release);
-			assumed_kbps_at_start_.store(
-				(uint32_t)replay_buffer_util::estimated_kbps(cfg_, eff),
-				std::memory_order_release);
-
-			uint64_t auto_mb = replay_buffer_util::auto_derived_max_size_mb(cfg_, eff);
-			uint32_t assumed_kbps = assumed_kbps_at_start_.load(std::memory_order_relaxed);
-			auto audio_kbps = [&]() -> uint32_t {
-				uint32_t tracks = cfg_.audio_tracks, c = 0;
-				for (; tracks; tracks >>= 1) c += tracks & 1;
-				return cfg_.audio_bitrate * c;
-			};
+			sizing->resolved_mb = resolved_mb;
+			sizing->was_clamped = was_clamped;
+			sizing->replay_seconds = cfg.replay_seconds;
+			sizing->assumed_kbps = assumed_kbps;
 
 			if (was_clamped) {
 				blog(LOG_WARNING,
@@ -1104,63 +1113,65 @@ bool SceneSlot::setup_outputs(const EffectiveRC &eff)
 				     "explicit value to suppress this warning, OR lower the "
 				     "replay duration, OR lower the rate-control quality, OR "
 				     "switch to a bitrate-based rate-control mode.",
-				     cfg_.name.c_str(),
+				     cfg.name.c_str(),
 				     (unsigned long long)requested_mb,
 				     (unsigned long long)resolved_mb,
 				     (unsigned long long)replay_buffer_util::available_physical_mb(),
-				     cfg_.replay_seconds);
+				     cfg.replay_seconds);
 			} else {
-				if (cfg_.replay_max_size_mb == 0) {
+				if (cfg.replay_max_size_mb == 0) {
 					blog(LOG_INFO,
 					     "[multi-scene-rec] '%s': replay buffer reserved %llu MB "
 					     "(auto-derived from %ux%u@%ufps %s; assumes %u kbps total, "
 					     "incl. %u kbps audio)",
-					     cfg_.name.c_str(), (unsigned long long)resolved_mb,
-					     cfg_.width, cfg_.height,
-					     cfg_.fps_den > 0 ? cfg_.fps_num / cfg_.fps_den : cfg_.fps_num,
-					     eff.mode.c_str(), assumed_kbps, audio_kbps());
+					     cfg.name.c_str(), (unsigned long long)resolved_mb,
+					     cfg.width, cfg.height,
+					     cfg.fps_den > 0 ? cfg.fps_num / cfg.fps_den : cfg.fps_num,
+					     eff.mode.c_str(), assumed_kbps,
+					     cfg.audio_bitrate * replay_buffer_util::popcount32(cfg.audio_tracks));
 				} else {
 					blog(LOG_INFO,
 					     "[multi-scene-rec] '%s': replay buffer reserved %llu MB "
 					     "(user override; auto-derived would have been %llu MB)",
-					     cfg_.name.c_str(), (unsigned long long)resolved_mb,
+					     cfg.name.c_str(), (unsigned long long)resolved_mb,
 					     (unsigned long long)auto_mb);
 				}
 			}
 
 			obs_data_t *rb = obs_data_create();
-			obs_data_set_string(rb, "directory", cfg_.path.c_str());
-			obs_data_set_string(rb, "format", replay_util::build_replay_format(cfg_).c_str());
-			obs_data_set_string(rb, "extension", cfg_.container.empty() ? "mp4" : cfg_.container.c_str());
-			obs_data_set_int(rb, "max_time_sec", cfg_.replay_seconds);
+			obs_data_set_string(rb, "directory", cfg.path.c_str());
+			obs_data_set_string(rb, "format", replay_util::build_replay_format(cfg).c_str());
+			obs_data_set_string(rb, "extension", cfg.container.empty() ? "mp4" : cfg.container.c_str());
+			obs_data_set_int(rb, "max_time_sec", cfg.replay_seconds);
 			obs_data_set_int(rb, "max_size_mb", (long long)resolved_mb);
 
-			replay_out_ = obs_output_create("replay_buffer", ("replay_out_" + cfg_.id).c_str(), rb, nullptr);
+			replay = obs_output_create("replay_buffer", ("replay_out_" + cfg.id).c_str(), rb, nullptr);
 			obs_data_release(rb);
-			if (!replay_out_) {
-				blog(LOG_WARNING, "[multi-scene-rec] '%s' replay create failed", cfg_.name.c_str());
+			if (!replay) {
+				blog(LOG_WARNING, "[multi-scene-rec] '%s' replay create failed", cfg.name.c_str());
 			} else {
-				obs_output_set_video_encoder(replay_out_, venc_);
-				for (size_t i = 0; i < aencs_.size(); ++i)
-					obs_output_set_audio_encoder(replay_out_, aencs_[i], i);
+				*out_replay = replay;
+				obs_output_set_video_encoder(replay, venc);
+				for (size_t i = 0; i < aencs.size(); ++i)
+					obs_output_set_audio_encoder(replay, aencs[i], i);
 
-				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "stop",
+				signal_handler_connect(obs_output_get_signal_handler(replay), "stop",
 						       &SceneSlot::on_replay_output_stop, hotkey_handle_);
-				signal_handler_connect(obs_output_get_signal_handler(replay_out_), "saved",
+				signal_handler_connect(obs_output_get_signal_handler(replay), "saved",
 						       &SceneSlot::on_replay_saved, hotkey_handle_);
 
-				if (cfg_.container == "mp4" || cfg_.container == "MP4") {
+				if (cfg.container == "mp4" || cfg.container == "MP4") {
 					blog(LOG_WARNING,
 					     "[multi-scene-rec] '%s': MP4 replay buffer will be unrecoverable if OBS crashes before save. Prefer MKV.",
-					     cfg_.name.c_str());
+					     cfg.name.c_str());
 				}
 			}
 		}
 	}
 
 	// At least one output must have been created.
-	if (!rec_out_ && !replay_out_) {
-		blog(LOG_ERROR, "[multi-scene-rec] '%s' no outputs created", cfg_.name.c_str());
+	if (!rec && !replay) {
+		blog(LOG_ERROR, "[multi-scene-rec] '%s' no outputs created", cfg.name.c_str());
 		return false;
 	}
 	return true;
@@ -1329,12 +1340,31 @@ void SceneSlot::on_record_hotkey(void *data, obs_hotkey_id /*id*/, obs_hotkey_t 
 	if (!sp)
 		return;
 	if (sp->is_running()) {
-		sp->stop();
+		// F-002: stop() can block for hundreds of ms (wait_for_output_stop
+		// flush) and this callback runs on libobs's hotkey thread, where a
+		// long stall delays EVERY hotkey in OBS. Defer to the UI task queue
+		// with a shared_ptr keep-alive — mirrors the external-stop deferral
+		// in on_rec_output_stop. If both this and an external stop queue a
+		// stop for the same slot, the second stop() is a no-op via the
+		// running_.exchange(false) guard.
+		auto *prevent_destroy = new std::shared_ptr<SceneSlot>(sp);
+		obs_queue_task(
+			OBS_TASK_UI,
+			[](void *d) {
+				auto *prevent = static_cast<std::shared_ptr<SceneSlot> *>(d);
+				(*prevent)->stop();
+				if (auto *dock = get_dock())
+					dock->refresh();
+				delete prevent;
+			},
+			prevent_destroy, false);
 	} else {
+		// Start stays on the hotkey thread (F-008 made start() cheap under
+		// its lock); the dock refresh is queued via the F-006-safe helper
+		// instead of reading g_dock from this non-UI thread.
 		sp->start();
+		notify_dock_refresh();
 	}
-	if (auto *dock = get_dock())
-		QMetaObject::invokeMethod(dock, "refresh", Qt::QueuedConnection);
 }
 
 void SceneSlot::on_rec_output_stop(void *data, calldata_t *cd)
@@ -1398,12 +1428,16 @@ void SceneSlot::on_replay_saved(void *data, calldata_t * /*cd*/)
 
 void SceneSlot::log_replay_saved()
 {
+	// F-001: hold our own strong ref across the proc-handler query so a
+	// concurrent teardown cannot free the output between the member copy
+	// and the call below. Null ref (never started, or mid-destruction) ->
+	// existing '<unknown>' path.
 	std::string name;
 	obs_output_t *replay = nullptr;
 	{
 		std::lock_guard<std::mutex> lk(slot_mtx_);
 		name = cfg_.name;
-		replay = replay_out_;
+		replay = obs_output_get_ref(replay_out_);
 	}
 	if (!replay) {
 		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", name.c_str());
@@ -1412,12 +1446,14 @@ void SceneSlot::log_replay_saved()
 	proc_handler_t *ph = obs_output_get_proc_handler(replay);
 	if (!ph) {
 		blog(LOG_INFO, "[multi-scene-rec] '%s' replay save wrote '<unknown>'", name.c_str());
+		obs_output_release(replay);
 		return;
 	}
 	calldata_t cd;
 	calldata_init(&cd);
 	proc_handler_call(ph, "get_last_replay", &cd);
 	const char *path = calldata_string(&cd, "path");
+	obs_output_release(replay);
 
 	uint64_t start_ns = start_time_ns_.load(std::memory_order_acquire);
 	uint64_t uptime_sec = start_ns ? (os_gettime_ns() - start_ns) / 1000000000ULL : 0;
@@ -1526,17 +1562,24 @@ SceneSlot::Stats SceneSlot::stats()
 	if (!running_.load())
 		return out;
 
+	// F-001: take our own strong refs under slot_mtx_, then query OUTSIDE the
+	// lock on the ref'd pointers. A concurrent teardown can release the
+	// members at any time after we unlock, but it can no longer free the
+	// objects out from under the queries below.
 	obs_output_t *primary = nullptr;
 	obs_output_t *replay = nullptr;
 	bool fallback = false;
 	{
 		std::lock_guard<std::mutex> lk(slot_mtx_);
-		primary = rec_out_ ? rec_out_ : replay_out_;
-		replay = replay_out_;
+		primary = obs_output_get_ref(rec_out_ ? rec_out_ : replay_out_);
+		replay = obs_output_get_ref(replay_out_);
 		fallback = encoder_fallback_;
 	}
-	if (!primary)
+	if (!primary) {
+		if (replay)
+			obs_output_release(replay);
 		return out;
+	}
 
 	out.active = obs_output_active(primary);
 	out.replay_active = replay ? obs_output_active(replay) : false;
@@ -1544,6 +1587,10 @@ SceneSlot::Stats SceneSlot::stats()
 	out.dropped_frames = obs_output_get_frames_dropped(primary);
 	out.total_bytes = obs_output_get_total_bytes(primary);
 	out.encoder_fallback = fallback;
+
+	if (replay)
+		obs_output_release(replay);
+	obs_output_release(primary);
 
 	uint64_t now_ns = os_gettime_ns();
 	std::lock_guard<std::mutex> slk(stats_mtx_);

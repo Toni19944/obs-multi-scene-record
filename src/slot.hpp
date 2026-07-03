@@ -250,22 +250,43 @@ private:
     // get_last_replay proc. NO plugin locks.
     void log_replay_saved();
 
-    bool setup_encoders();
+    // Replay-buffer sizing telemetry computed by setup_outputs. start()
+    // commits it into the lock-free atomics only when the built pipeline is
+    // actually committed, so an aborted/superseded start never publishes
+    // stale sizing values (F-008).
+    struct ReplaySizing {
+        uint64_t resolved_mb    = 0;
+        bool     was_clamped    = false;
+        uint32_t replay_seconds = 0;
+        uint32_t assumed_kbps   = 0;
+    };
+
+    // F-008: both builders run UNLOCKED on start()'s config snapshot and
+    // write into caller-owned locals; SceneSlot members are only touched by
+    // start()'s short commit phase under slot_mtx_.
+    bool setup_encoders(const Config& cfg, std::vector<obs_encoder_t*>& aencs,
+                        std::vector<int>& tracks);
     // Resolved rate-control passed in by start() before taking slot_mtx_, so
     // the replay-buffer memory-cap estimate uses the OWNER's effective values
     // (consumer reads route through SlotManager::effective_rate_control). The
     // helper takes mtx_ then shared_mtx_ independently; resolving before
     // slot_mtx_ keeps the global order mtx_ -> slot_mtx_ -> shared_mtx_.
-    bool setup_outputs(const struct EffectiveRC& eff);
-    // Public locking entry point: acquires slot_mtx_ then calls teardown_locked().
+    bool setup_outputs(const Config& cfg, const struct EffectiveRC& eff,
+                       obs_encoder_t* venc,
+                       const std::vector<obs_encoder_t*>& aencs,
+                       obs_output_t** out_rec, obs_output_t** out_replay,
+                       ReplaySizing* sizing);
+    // Full teardown: detaches the outputs under slot_mtx_, waits for their
+    // async stop OUTSIDE the lock, then releases everything under a short
+    // re-acquire. start()'s failure paths no longer need an under-lock
+    // variant — they tear down locals that never reached the members (F-008).
     void teardown();
-    // Core teardown. Caller MUST already hold slot_mtx_ (e.g. start()'s
-    // in-lock failure paths) so the non-recursive mutex is not re-entered.
-    void teardown_locked();
 
     // Blocks until obs_output_active(out) is false (async stop completes),
-    // up to a 5 s timeout; force-stops as a last resort.
-    void wait_for_output_stop(obs_output_t* out);
+    // up to a 5 s timeout; force-stops as a last resort. `name` is the slot
+    // name for the timeout warning, captured under slot_mtx_ by the caller
+    // (F-003: this helper runs unlocked and must not read cfg_ itself).
+    void wait_for_output_stop(obs_output_t* out, const std::string& name);
 
     // Guards every mutable SceneSlot member below (outputs, audio encoders,
     // the borrowed shared-encoder pointer, group_key_, cfg_). Acquired by
@@ -277,6 +298,13 @@ private:
 
     Config cfg_;
     std::atomic<bool> running_{false};
+
+    // F-008: monotonically increasing tag for start() attempts, guarded by
+    // slot_mtx_. start() records it while snapshotting and re-checks it in
+    // the commit phase; a mismatch means a stop()/start() superseded this
+    // attempt while the pipeline was being built unlocked, so the attempt
+    // discards its locals instead of committing over the newer state.
+    uint64_t start_epoch_ = 0;
 
     // FR-011: wall-clock slot start time for uptime check in log_replay_saved.
     std::atomic<uint64_t> start_time_ns_{0};
@@ -408,7 +436,11 @@ uint64_t auto_derived_max_size_mb(const SceneSlot::Config &cfg, const struct Eff
 uint64_t available_physical_mb();
 
 // Entry point: returns the resolved cap (0 = decline replay buffer).
+// O-003: also surfaces the auto-derived MB and assumed kbps computed
+// internally so callers reuse them instead of re-running the estimate chain.
 uint64_t resolve_max_size_mb(const SceneSlot::Config &cfg, const struct EffectiveRC &eff,
-                             bool *out_was_clamped, uint64_t *out_requested_mb);
+                             bool *out_was_clamped, uint64_t *out_requested_mb,
+                             uint64_t *out_auto_mb = nullptr,
+                             uint32_t *out_assumed_kbps = nullptr);
 
 } // namespace replay_buffer_util

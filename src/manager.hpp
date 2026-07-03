@@ -85,6 +85,16 @@ public:
     void remove_slot(size_t i);
     void update_slot(size_t i, const SceneSlot::Config& cfg);
 
+    // F-005: identity-based mutators for the dock's Edit/Remove dialogs. The
+    // slot list can be rebuilt while a modal is open, so acting on a captured
+    // row index could hit the wrong slot. These re-resolve id -> current
+    // index and act atomically under mtx_ (a dock-side find-then-call would
+    // reintroduce the TOCTOU window). Return false — with zero mutation —
+    // when the id no longer resolves.
+    bool update_slot_by_id(const std::string& slot_id,
+                           const SceneSlot::Config& cfg);
+    bool remove_slot_by_id(const std::string& slot_id);
+
     // Start / stop all
     void start_all();
     void stop_all();
@@ -140,8 +150,9 @@ public:
     void save_to(obs_data_t* save_data);
     void load_from(obs_data_t* save_data);
 
-    // Monotonic counter bumped whenever slots_ is rebuilt (load_from). UI
-    // uses it to detect that raw SceneSlot* from slot_at() may be stale.
+    // Monotonic counter bumped whenever slots_ is rebuilt (load_from) or an
+    // entry is removed (remove_slot / remove_slot_by_id). UI uses it to
+    // detect that raw SceneSlot* from slot_at() may be stale.
     size_t generation() const;
 
 private:

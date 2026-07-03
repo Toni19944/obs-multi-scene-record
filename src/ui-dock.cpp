@@ -146,6 +146,10 @@ void MultiSceneRecordDock::refresh()
 
     table_->setRowCount(n);
 
+    // O-001: full rebuild — reset the render cache; it is refilled row by
+    // row below as the base rendering is applied.
+    row_cache_.assign((size_t)n, RowRenderCache{});
+
     auto set_text = [this](int row, int col, const QString& text) {
         if (auto* it = table_->item(row, col)) {
             it->setText(text);
@@ -159,6 +163,8 @@ void MultiSceneRecordDock::refresh()
         if (!s) continue;
         const auto& c = s->config();
 
+        const bool running = s->is_running();
+
         // ITEM C: COL_STATE is a clickable per-row start/stop toggle. Reuse
         // the existing cell widget when present (F2): only allocate a new
         // QPushButton when the row was just added. The lambda captures `i`
@@ -167,7 +173,6 @@ void MultiSceneRecordDock::refresh()
         // never move, rows below are dropped, so a row's index never changes
         // for the lifetime of its button.
         {
-            const bool running = s->is_running();
             auto* sb = qobject_cast<QPushButton*>(
                 table_->cellWidget(i, COL_STATE));
             if (sb) {
@@ -187,17 +192,35 @@ void MultiSceneRecordDock::refresh()
         set_text(i, COL_SCENE, QString::fromStdString(c.scene_name));
         set_text(i, COL_RES,
             QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num));
+        QString enc_display;
         if (!c.shared_encoder_slot_id.empty()) {
             std::string primary_name = mgr.slot_name_by_id(c.shared_encoder_slot_id);
-            QString display = primary_name.empty()
+            enc_display = primary_name.empty()
                 ? QString::fromUtf8("\xe2\x86\x92 [deleted]")
                 : QString::fromUtf8("\xe2\x86\x92 ") + QString::fromStdString(primary_name);
-            set_text(i, COL_ENC, display);
         } else {
-            set_text(i, COL_ENC, QString::fromStdString(c.video_encoder_id));
+            enc_display = QString::fromStdString(c.video_encoder_id);
+        }
+        set_text(i, COL_ENC, enc_display);
+        // O-001: apply the base (non-fallback) foreground here so a
+        // no-transition tick can skip styling entirely; record what this
+        // row now shows.
+        if (auto* enc = table_->item(i, COL_ENC))
+            enc->setForeground(QBrush(QColor(140, 140, 140)));
+        {
+            RowRenderCache& rc = row_cache_[(size_t)i];
+            rc.running      = running;
+            rc.replay_only  = c.replay_only;
+            rc.enc_display  = enc_display;
+            rc.fallback     = false;
+            rc.dropped_warn = false;
         }
         set_text(i, COL_FRAMES,  "--");
         set_text(i, COL_DROPPED, "--");
+        // O-001: base (non-warning) dropped-frames foreground, matching
+        // rc.dropped_warn = false above.
+        if (auto* dr = table_->item(i, COL_DROPPED))
+            dr->setForeground(QBrush(QColor(140, 140, 140)));
         set_text(i, COL_KBPS,    "--");
         set_text(i, COL_REPLAY,
             c.replay_enabled
@@ -236,41 +259,62 @@ void MultiSceneRecordDock::refresh_stats()
         const auto& c = s->config();
         SceneSlot::Stats st = s->stats();
 
+        // O-001: the 1 Hz tick only STYLES and resolves owner names on
+        // transitions. Cheap inputs (is_running, encoder_fallback,
+        // dropped>0) are compared against the per-row cache; when nothing
+        // changed, no setStyleSheet/setForeground/slot_name_by_id runs.
+        // Renames and list changes funnel through refresh(), which rebuilds
+        // the cache, so those repaint correctly on their transition tick.
+        if ((size_t)i >= row_cache_.size()) { refresh(); return; }
+        RowRenderCache& rc = row_cache_[(size_t)i];
+        const bool running = s->is_running();
+
         // ITEM C: COL_STATE is now a cell widget, not a QTableWidgetItem.
         // Mutate the existing button in place (no rebuild) so the polled
         // stats tick keeps the toggle's label/color in sync with true state.
-        if (auto* sb = qobject_cast<QPushButton*>(
-                table_->cellWidget(i, COL_STATE))) {
-            const bool running = s->is_running();
-            sb->setText(state_btn_text(running, c.replay_only));
-            sb->setStyleSheet(state_btn_style(running));
+        if (running != rc.running || c.replay_only != rc.replay_only) {
+            if (auto* sb = qobject_cast<QPushButton*>(
+                    table_->cellWidget(i, COL_STATE))) {
+                sb->setText(state_btn_text(running, c.replay_only));
+                sb->setStyleSheet(state_btn_style(running));
+                rc.running     = running;
+                rc.replay_only = c.replay_only;
+            }
         }
 
-        if (auto* enc = table_->item(i, COL_ENC)) {
-            QString base;
-            if (!c.shared_encoder_slot_id.empty()) {
-                std::string pn = mgr.slot_name_by_id(c.shared_encoder_slot_id);
-                base = pn.empty()
-                    ? QString::fromUtf8("\xe2\x86\x92 [deleted]")
-                    : QString::fromUtf8("\xe2\x86\x92 ") + QString::fromStdString(pn);
-            } else {
-                base = QString::fromStdString(c.video_encoder_id);
-            }
-            if (st.encoder_fallback) {
-                enc->setText(base + " [CBR fallback]");
-                enc->setForeground(QBrush(QColor(220, 140, 60)));
-            } else {
-                enc->setText(base);
-                enc->setForeground(QBrush(QColor(140, 140, 140)));
+        if (st.encoder_fallback != rc.fallback) {
+            if (auto* enc = table_->item(i, COL_ENC)) {
+                QString base;
+                if (!c.shared_encoder_slot_id.empty()) {
+                    std::string pn = mgr.slot_name_by_id(c.shared_encoder_slot_id);
+                    base = pn.empty()
+                        ? QString::fromUtf8("\xe2\x86\x92 [deleted]")
+                        : QString::fromUtf8("\xe2\x86\x92 ") + QString::fromStdString(pn);
+                } else {
+                    base = QString::fromStdString(c.video_encoder_id);
+                }
+                if (st.encoder_fallback) {
+                    enc->setText(base + " [CBR fallback]");
+                    enc->setForeground(QBrush(QColor(220, 140, 60)));
+                } else {
+                    enc->setText(base);
+                    enc->setForeground(QBrush(QColor(140, 140, 140)));
+                }
+                rc.enc_display = base;
+                rc.fallback    = st.encoder_fallback;
             }
         }
         if (auto* it = table_->item(i, COL_FRAMES))
-            it->setText(s->is_running() ? QString::number(st.total_frames) : "--");
+            it->setText(running ? QString::number(st.total_frames) : "--");
         if (auto* it = table_->item(i, COL_DROPPED)) {
-            it->setText(s->is_running() ? QString::number(st.dropped_frames) : "--");
-            it->setForeground(QBrush(st.dropped_frames > 0
-                                     ? QColor(220, 140, 60)
-                                     : QColor(140, 140, 140)));
+            it->setText(running ? QString::number(st.dropped_frames) : "--");
+            const bool dropped_warn = st.dropped_frames > 0;
+            if (dropped_warn != rc.dropped_warn) {
+                it->setForeground(QBrush(dropped_warn
+                                         ? QColor(220, 140, 60)
+                                         : QColor(140, 140, 140)));
+                rc.dropped_warn = dropped_warn;
+            }
         }
         if (auto* it = table_->item(i, COL_KBPS))
             it->setText(s->is_running() ? fmt_bytes_rate(st.kbps) : "--");
@@ -300,9 +344,18 @@ void MultiSceneRecordDock::on_edit()
     if (row < 0) return;
     auto* s = SlotManager::instance().slot_at((size_t)row);
     if (!s) return;
+    // F-005: capture the slot's stable identity BEFORE the modal. The slot
+    // list can be rebuilt while the dialog is open (scene-collection switch,
+    // second control path), so the row index must not be trusted afterwards:
+    // the manager re-resolves the id atomically and refuses when it's gone.
+    const std::string slot_id = s->config().id;
     SlotEditor dlg(this, s->config());
     if (dlg.exec() == QDialog::Accepted) {
-        SlotManager::instance().update_slot((size_t)row, dlg.result());
+        if (!SlotManager::instance().update_slot_by_id(slot_id, dlg.result())) {
+            QMessageBox::warning(
+                this, tr("Slots changed"),
+                tr("Slots changed while the dialog was open — no changes applied."));
+        }
         refresh();
     }
 }
@@ -311,8 +364,17 @@ void MultiSceneRecordDock::on_remove()
 {
     int row = current_row();
     if (row < 0) return;
+    auto* s = SlotManager::instance().slot_at((size_t)row);
+    if (!s) return;
+    // F-005: same identity capture as on_edit — the confirmation box is
+    // modal, and the row under it can move or vanish before the user clicks.
+    const std::string slot_id = s->config().id;
     if (QMessageBox::question(this, "Remove", "Remove this slot?") != QMessageBox::Yes) return;
-    SlotManager::instance().remove_slot((size_t)row);
+    if (!SlotManager::instance().remove_slot_by_id(slot_id)) {
+        QMessageBox::warning(
+            this, tr("Slots changed"),
+            tr("Slots changed while the dialog was open — no changes applied."));
+    }
     refresh();
 }
 
