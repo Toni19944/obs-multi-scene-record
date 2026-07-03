@@ -9,7 +9,7 @@ class MultiSceneRecordDock;
 // UI-THREAD ONLY: g_dock is written on the UI thread with no synchronization,
 // so calling this from any other thread is a data race. Non-UI threads that
 // want a dock refresh must go through notify_dock_refresh() instead.
-MultiSceneRecordDock* get_dock();
+MultiSceneRecordDock *get_dock();
 
 // Queue a dock refresh onto the OBS UI task queue. Safe to call from ANY
 // thread: the dock pointer is only read inside the queued task (which runs
