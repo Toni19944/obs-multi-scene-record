@@ -340,7 +340,7 @@ void SlotManager::on_start_selected_hotkey(void *data, obs_hotkey_id, obs_hotkey
 	notify_dock_refresh();
 }
 
-void SlotManager::on_stop_selected_hotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+void SlotManager::on_stop_selected_hotkey(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
 {
 	if (!pressed)
 		return;
