@@ -16,7 +16,11 @@
 #include <QSettings>
 
 enum Col {
-	COL_STATE = 0,
+	// Feature 019 (FR-001): leftmost enable/disable checkbox; every other
+	// column shifts one right. This enum is the single source of column
+	// indices, so the shift is complete here.
+	COL_ENABLED = 0,
+	COL_STATE,
 	COL_NAME,
 	COL_SCENE,
 	COL_RES,
@@ -66,7 +70,7 @@ MultiSceneRecordDock::MultiSceneRecordDock(QWidget *parent) : QWidget(parent)
 {
 	table_ = new QTableWidget(0, COL_COUNT, this);
 	table_->setHorizontalHeaderLabels(
-		{"", "Name", "Scene", "Res/FPS", "Encoder", "Frames", "Dropped", "Bitrate", "Replay"});
+		{"", "", "Name", "Scene", "Res/FPS", "Encoder", "Frames", "Dropped", "Bitrate", "Replay"});
 	table_->verticalHeader()->setVisible(false);
 	table_->setSelectionBehavior(QAbstractItemView::SelectRows);
 	table_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -79,8 +83,8 @@ MultiSceneRecordDock::MultiSceneRecordDock(QWidget *parent) : QWidget(parent)
 	add_btn_ = new QPushButton("Add");
 	edit_btn_ = new QPushButton("Edit");
 	rm_btn_ = new QPushButton("Remove");
-	start_btn_ = new QPushButton("Start all");
-	stop_btn_ = new QPushButton("Stop all");
+	start_btn_ = new QPushButton("Start selected");
+	stop_btn_ = new QPushButton("Stop selected");
 	save_btn_ = new QPushButton("Save replay");
 	stats_chk_ = new QCheckBox("Show stats");
 
@@ -104,8 +108,8 @@ MultiSceneRecordDock::MultiSceneRecordDock(QWidget *parent) : QWidget(parent)
 	connect(add_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_add);
 	connect(edit_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_edit);
 	connect(rm_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_remove);
-	connect(start_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_start_all);
-	connect(stop_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_stop_all);
+	connect(start_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_start_selected);
+	connect(stop_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_stop_selected);
 	connect(save_btn_, &QPushButton::clicked, this, &MultiSceneRecordDock::on_save_replay);
 	connect(stats_chk_, &QCheckBox::toggled, this, &MultiSceneRecordDock::on_stats_toggled);
 	connect(table_, &QTableWidget::cellDoubleClicked, this, &MultiSceneRecordDock::on_cell_double_clicked);
@@ -172,6 +176,32 @@ void MultiSceneRecordDock::refresh()
 		const auto &c = s->config();
 
 		const bool running = s->is_running();
+		const bool enabled = c.enabled;
+
+		// Feature 019 (research D6): leftmost enable/disable checkbox.
+		// Same cell-widget reuse discipline as the COL_STATE button below.
+		// Programmatic sync happens with signals blocked so rebuilds never
+		// re-enter the toggle handler — every user toggle ends in
+		// refresh(), which re-reads config().enabled and repaints the true
+		// state (rapid-toggle convergence).
+		{
+			auto *wrap = table_->cellWidget(i, COL_ENABLED);
+			QCheckBox *cb = wrap ? wrap->findChild<QCheckBox *>() : nullptr;
+			if (!cb) {
+				wrap = new QWidget;
+				auto *cbl = new QHBoxLayout(wrap);
+				cbl->setContentsMargins(0, 0, 0, 0);
+				cbl->setAlignment(Qt::AlignCenter);
+				cb = new QCheckBox(wrap);
+				cbl->addWidget(cb);
+				connect(cb, &QCheckBox::toggled, this,
+					[this, i](bool on) { on_enabled_toggled(i, on); });
+				table_->setCellWidget(i, COL_ENABLED, wrap);
+			}
+			cb->blockSignals(true);
+			cb->setChecked(enabled);
+			cb->blockSignals(false);
+		}
 
 		// ITEM C: COL_STATE is a clickable per-row start/stop toggle. Reuse
 		// the existing cell widget when present (F2): only allocate a new
@@ -181,21 +211,35 @@ void MultiSceneRecordDock::refresh()
 		// never move, rows below are dropped, so a row's index never changes
 		// for the lifetime of its button.
 		{
+			// Feature 019 (FR-012): a disabled row's button shows "off" in
+			// the stopped style but STAYS clickable — a click routes to
+			// start(), whose gate ignores it with the FR-004 log line.
 			auto *sb = qobject_cast<QPushButton *>(table_->cellWidget(i, COL_STATE));
 			if (sb) {
-				sb->setText(state_btn_text(running, c.replay_only));
-				sb->setStyleSheet(state_btn_style(running));
+				sb->setText(state_btn_text(running && enabled, c.replay_only));
+				sb->setStyleSheet(state_btn_style(running && enabled));
 			} else {
-				sb = new QPushButton(state_btn_text(running, c.replay_only));
+				sb = new QPushButton(state_btn_text(running && enabled, c.replay_only));
 				sb->setFlat(true);
 				sb->setCursor(Qt::PointingHandCursor);
-				sb->setStyleSheet(state_btn_style(running));
+				sb->setStyleSheet(state_btn_style(running && enabled));
 				connect(sb, &QPushButton::clicked, this, [this, i]() { on_state_clicked(i); });
 				table_->setCellWidget(i, COL_STATE, sb);
 			}
 		}
 		set_text(i, COL_NAME, QString::fromStdString(c.name));
 		set_text(i, COL_SCENE, QString::fromStdString(c.scene_name));
+		// Feature 019 (FR-012): disabled rows dim name/scene; re-enabled
+		// rows must reset to the default palette because items are reused
+		// across refreshes.
+		for (int col : {COL_NAME, COL_SCENE}) {
+			if (auto *it = table_->item(i, col)) {
+				if (enabled)
+					it->setData(Qt::ForegroundRole, QVariant());
+				else
+					it->setForeground(QBrush(QColor(140, 140, 140)));
+			}
+		}
 		set_text(i, COL_RES, QString("%1x%2 @ %3").arg(c.width).arg(c.height).arg(c.fps_num));
 		QString enc_display;
 		if (!c.shared_encoder_slot_id.empty()) {
@@ -216,6 +260,7 @@ void MultiSceneRecordDock::refresh()
 			RowRenderCache &rc = row_cache_[(size_t)i];
 			rc.running = running;
 			rc.replay_only = c.replay_only;
+			rc.enabled = enabled;
 			rc.enc_display = enc_display;
 			rc.fallback = false;
 			rc.dropped_warn = false;
@@ -282,6 +327,12 @@ void MultiSceneRecordDock::refresh_stats()
 			return;
 		}
 		RowRenderCache &rc = row_cache_[(size_t)i];
+
+		// Feature 019 (O-001): disabled rows can't run — skip the 1 Hz
+		// styling work entirely; refresh()'s base "--" rendering stands.
+		if (!rc.enabled)
+			continue;
+
 		const bool running = s->is_running();
 
 		// ITEM C: COL_STATE is now a cell widget, not a QTableWidgetItem.
@@ -396,18 +447,37 @@ void MultiSceneRecordDock::on_remove()
 	refresh();
 }
 
-void MultiSceneRecordDock::on_start_all()
+void MultiSceneRecordDock::on_start_selected()
 {
-	// Validate that every slot has an output directory configured before
-	// attempting to start. A slot with an empty path will silently fail to
-	// record but (prior to the slot.cpp fix) appear as running in the UI.
+	// Validate that every ENABLED slot has an output directory configured
+	// before attempting to start. A slot with an empty path will silently
+	// fail to record but (prior to the slot.cpp fix) appear as running in
+	// the UI. Disabled slots are excluded (research D7): they aren't being
+	// started, so a missing path there must not block the selected subset.
 	auto &mgr = SlotManager::instance();
+	auto snap = mgr.snapshot_slots();
+	size_t enabled_count = 0;
 	QStringList no_path;
-	for (size_t i = 0; i < mgr.slot_count(); ++i) {
-		const SceneSlot *s = mgr.slot_at(i);
-		if (s && s->config().path.empty())
-			no_path << QString::fromStdString(s->config().name);
+	for (const auto &sp : snap.items) {
+		if (!sp)
+			continue;
+		const auto &c = sp->config();
+		if (!c.enabled)
+			continue;
+		++enabled_count;
+		if (c.path.empty())
+			no_path << QString::fromStdString(c.name);
 	}
+
+	// FR-011 (research D7): slots exist but none is enabled — tell the
+	// user why nothing will start; no state changes. The hotkey path logs
+	// instead (a dialog must never pop from a hotkey).
+	if (!snap.items.empty() && enabled_count == 0) {
+		QMessageBox::information(this, tr("No slots enabled"),
+					 tr("No slots are enabled — check at least one slot to use Start selected."));
+		return;
+	}
+
 	if (!no_path.isEmpty()) {
 		QMessageBox::critical(this, tr("Missing output directory"),
 				      tr("The following slots have no output directory configured "
@@ -417,12 +487,12 @@ void MultiSceneRecordDock::on_start_all()
 		return;
 	}
 
-	mgr.start_all();
+	mgr.start_selected();
 	refresh();
 }
-void MultiSceneRecordDock::on_stop_all()
+void MultiSceneRecordDock::on_stop_selected()
 {
-	SlotManager::instance().stop_all();
+	SlotManager::instance().stop_selected();
 	refresh();
 }
 
@@ -466,6 +536,51 @@ void MultiSceneRecordDock::on_state_clicked(int row)
 	// resets running_ on an empty/missing output path, so a failed start
 	// leaves the row showing "off" rather than a fake running state. Reuse
 	// the existing refresh() path (same as Start all / Stop all).
+	refresh();
+}
+
+void MultiSceneRecordDock::on_enabled_toggled(int row, bool checked)
+{
+	auto &mgr = SlotManager::instance();
+	SceneSlot *s = mgr.slot_at((size_t)row);
+	if (!s) {
+		refresh();
+		return;
+	}
+	// F-005: capture the stable id BEFORE any modal — the slot list can be
+	// rebuilt while the confirmation is open, so neither the row index nor
+	// the raw pointer may be trusted afterwards.
+	const std::string slot_id = s->config().id;
+
+	if (checked) {
+		mgr.set_slot_enabled_by_id(slot_id, true);
+		refresh();
+		return;
+	}
+
+	// FR-014: unchecking a recording slot stops it first — with the user's
+	// confirmation. Unchecking an idle slot never prompts.
+	if (s->is_running()) {
+		if (QMessageBox::question(this, tr("Disable slot"),
+					  tr("Are you sure you want to disable and stop this slot?")) !=
+		    QMessageBox::Yes) {
+			// Cancelled: re-sync the checkbox to the slot's actual state.
+			refresh();
+			return;
+		}
+	}
+
+	// Re-resolve by id after the (possible) modal; the shared_ptr keeps the
+	// slot alive across the stop. stop() is idempotent — a slot that
+	// stopped on its own while the prompt was open is a clean no-op.
+	auto snap = mgr.snapshot_slots();
+	for (const auto &sp : snap.items) {
+		if (sp && sp->config().id == slot_id) {
+			sp->stop();
+			break;
+		}
+	}
+	mgr.set_slot_enabled_by_id(slot_id, false); // refuses if the id vanished
 	refresh();
 }
 

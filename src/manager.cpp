@@ -1,4 +1,5 @@
 #include "manager.hpp"
+#include "plugin-main.hpp"
 
 SlotManager &SlotManager::instance()
 {
@@ -186,12 +187,34 @@ bool SlotManager::remove_slot_by_id(const std::string &slot_id)
 	return true;
 }
 
+bool SlotManager::set_slot_enabled_by_id(const std::string &id, bool enabled)
+{
+	// Feature 019 (research D4): resolve under mtx_, copy the shared_ptr,
+	// release mtx_, then take slot_mtx_ inside set_enabled — observes the
+	// global order mtx_ -> slot_mtx_ without holding both.
+	std::shared_ptr<SceneSlot> s;
+	{
+		std::lock_guard<std::mutex> lk(mtx_);
+		auto it = id_index_.find(id);
+		if (it == id_index_.end() || it->second >= slots_.size())
+			return false;
+		s = slots_[it->second];
+	}
+	s->set_enabled(enabled);
+	return true;
+}
+
 // ----------------------------------------------------------------------------
 // start / stop / hotkeys for all
 // ----------------------------------------------------------------------------
 
-void SlotManager::start_all()
+void SlotManager::start_selected()
 {
+	// Feature 019 (research D3): same shape as stop_all() — snapshot under
+	// mtx_, act outside the lock — but filtered to enabled slots. started_
+	// is still set so add_slot keeps auto-starting newly added slots (new
+	// slots default to enabled, so the semantics are unchanged). start()'s
+	// running_ CAS keeps already-running slots untouched (FR-006).
 	std::vector<std::shared_ptr<SceneSlot>> snapshot;
 	{
 		std::lock_guard<std::mutex> lk(mtx_);
@@ -199,7 +222,24 @@ void SlotManager::start_all()
 		snapshot = slots_;
 	}
 	for (auto &s : snapshot)
-		s->start();
+		if (s->config().enabled)
+			s->start();
+}
+
+void SlotManager::stop_selected()
+{
+	// Feature 019 (research D3): filters enabled AND is_running (lock-free
+	// atomic), so idle slots are untouched (FR-007). Lifecycle paths keep
+	// using the unfiltered stop_all() below.
+	std::vector<std::shared_ptr<SceneSlot>> snapshot;
+	{
+		std::lock_guard<std::mutex> lk(mtx_);
+		started_ = false;
+		snapshot = slots_;
+	}
+	for (auto &s : snapshot)
+		if (s->config().enabled && s->is_running())
+			s->stop();
 }
 
 void SlotManager::stop_all()
@@ -219,6 +259,34 @@ void SlotManager::register_all_hotkeys()
 	std::lock_guard<std::mutex> lk(mtx_);
 	for (auto &s : slots_)
 		s->register_hotkeys();
+
+	// Feature 019 (research D5): plugin-global "Start/Stop selected"
+	// hotkeys ride the same register cycle, so a scene-collection switch
+	// re-applies the NEW collection's bindings from the pending arrays
+	// (stashed by load_from). Registration is idempotent via the
+	// OBS_INVALID_HOTKEY_ID guard; pending arrays are applied then
+	// released exactly once.
+	if (hk_start_selected_ == OBS_INVALID_HOTKEY_ID)
+		hk_start_selected_ = obs_hotkey_register_frontend("msr.start_selected",
+								  "Multi-Scene Record: Start selected",
+								  &SlotManager::on_start_selected_hotkey, this);
+	if (pending_hk_start_selected_) {
+		if (hk_start_selected_ != OBS_INVALID_HOTKEY_ID)
+			obs_hotkey_load(hk_start_selected_, pending_hk_start_selected_);
+		obs_data_array_release(pending_hk_start_selected_);
+		pending_hk_start_selected_ = nullptr;
+	}
+
+	if (hk_stop_selected_ == OBS_INVALID_HOTKEY_ID)
+		hk_stop_selected_ = obs_hotkey_register_frontend("msr.stop_selected",
+								 "Multi-Scene Record: Stop selected",
+								 &SlotManager::on_stop_selected_hotkey, this);
+	if (pending_hk_stop_selected_) {
+		if (hk_stop_selected_ != OBS_INVALID_HOTKEY_ID)
+			obs_hotkey_load(hk_stop_selected_, pending_hk_stop_selected_);
+		obs_data_array_release(pending_hk_stop_selected_);
+		pending_hk_stop_selected_ = nullptr;
+	}
 }
 
 void SlotManager::unregister_all_hotkeys()
@@ -226,6 +294,69 @@ void SlotManager::unregister_all_hotkeys()
 	std::lock_guard<std::mutex> lk(mtx_);
 	for (auto &s : slots_)
 		s->unregister_hotkeys();
+
+	// Feature 019: mirror registration. Bindings were already persisted by
+	// save_to (OBS saves the collection before switching/exiting), so no
+	// capture is needed here — the next register_all_hotkeys() restores
+	// from the incoming collection's pending arrays.
+	if (hk_start_selected_ != OBS_INVALID_HOTKEY_ID) {
+		obs_hotkey_unregister(hk_start_selected_);
+		hk_start_selected_ = OBS_INVALID_HOTKEY_ID;
+	}
+	if (hk_stop_selected_ != OBS_INVALID_HOTKEY_ID) {
+		obs_hotkey_unregister(hk_stop_selected_);
+		hk_stop_selected_ = OBS_INVALID_HOTKEY_ID;
+	}
+}
+
+void SlotManager::on_start_selected_hotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+	if (!pressed)
+		return;
+	auto *self = static_cast<SlotManager *>(data);
+	if (!self)
+		return;
+
+	// FR-011 (research D7): the hotkey path must never pop a dialog — a
+	// zero-eligible press logs and does nothing.
+	bool any_enabled = false;
+	{
+		std::lock_guard<std::mutex> lk(self->mtx_);
+		for (auto &s : self->slots_) {
+			if (s->config().enabled) {
+				any_enabled = true;
+				break;
+			}
+		}
+	}
+	if (!any_enabled) {
+		blog(LOG_INFO, "[multi-scene-rec] start selected: no enabled slots to start");
+		return;
+	}
+
+	// F-008 precedent: start() is cheap under its locks, so starting stays
+	// on the hotkey thread — exactly like the per-slot record hotkey.
+	self->start_selected();
+	notify_dock_refresh();
+}
+
+void SlotManager::on_stop_selected_hotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+	if (!pressed)
+		return;
+
+	// Constitution III: stop() can block up to 5 s per output flush, so
+	// the actual stop is deferred to the UI task queue — same deferral as
+	// on_record_hotkey's stop branch. SlotManager is a module-lifetime
+	// singleton, so no weak-ptr keep-alive is needed (unlike per-slot
+	// handles).
+	obs_queue_task(
+		OBS_TASK_UI,
+		[](void *) {
+			SlotManager::instance().stop_selected();
+			notify_dock_refresh();
+		},
+		nullptr, false);
 }
 
 bool SlotManager::config_by_slot_id(const std::string &slot_id, SceneSlot::Config &out) const
@@ -418,6 +549,7 @@ static obs_data_t *slot_to_data(const SceneSlot::Config &c)
 	obs_data_set_string(d, "hevc_tier", c.hevc_tier.c_str());
 	obs_data_set_int(d, "av1_tile_cols", c.av1_tile_cols);
 	obs_data_set_int(d, "av1_tile_rows", c.av1_tile_rows);
+	obs_data_set_bool(d, "enabled", c.enabled);
 	return d;
 }
 
@@ -638,6 +770,12 @@ static SceneSlot::Config slot_from_data(obs_data_t *d, std::unordered_map<std::s
 	c.av1_tile_cols = obs_data_has_user_value(d, "av1_tile_cols") ? (int)obs_data_get_int(d, "av1_tile_cols") : -1;
 	c.av1_tile_rows = obs_data_has_user_value(d, "av1_tile_rows") ? (int)obs_data_get_int(d, "av1_tile_rows") : -1;
 
+	// Feature 019: absent key (pre-feature save) defaults to true so old
+	// collections load fully enabled — same has_user_value pattern as
+	// psycho_aq/cabac/mbtree above (FR-002, SC-002). Stored beside the
+	// stable slot id, so the flag can never shift between slots (FR-003).
+	c.enabled = obs_data_has_user_value(d, "enabled") ? obs_data_get_bool(d, "enabled") : true;
+
 	// c.id left empty if absent -> SceneSlot ctor generates a fresh one.
 	return c;
 }
@@ -657,6 +795,29 @@ void SlotManager::save_to(obs_data_t *save_data)
 			s->save_hotkey_bindings(d);
 			obs_data_array_push_back(arr, d);
 			obs_data_release(d);
+		}
+
+		// Feature 019 (ITEM A): persist the two global hotkey bindings at
+		// the plugin root (they are plugin-global, not per-slot). Prefer
+		// the live hotkeys; fall back to a not-yet-applied pending array
+		// (a save landing between load_from and FINISHED_LOADING).
+		if (hk_start_selected_ != OBS_INVALID_HOTKEY_ID) {
+			obs_data_array_t *a = obs_hotkey_save(hk_start_selected_);
+			if (a) {
+				obs_data_set_array(root, "hk_start_selected", a);
+				obs_data_array_release(a);
+			}
+		} else if (pending_hk_start_selected_) {
+			obs_data_set_array(root, "hk_start_selected", pending_hk_start_selected_);
+		}
+		if (hk_stop_selected_ != OBS_INVALID_HOTKEY_ID) {
+			obs_data_array_t *a = obs_hotkey_save(hk_stop_selected_);
+			if (a) {
+				obs_data_set_array(root, "hk_stop_selected", a);
+				obs_data_array_release(a);
+			}
+		} else if (pending_hk_stop_selected_) {
+			obs_data_set_array(root, "hk_stop_selected", pending_hk_stop_selected_);
 		}
 	}
 	obs_data_set_array(root, "slots", arr);
@@ -678,6 +839,18 @@ void SlotManager::load_from(obs_data_t *save_data)
 
 	{
 		std::lock_guard<std::mutex> lk(mtx_);
+
+		// Feature 019 (ITEM A): stash the global hotkey bindings for
+		// register_all_hotkeys() to apply then release. Replace any
+		// unapplied leftover first (double load without registration).
+		// obs_data_get_array returns an owned ref; nullptr when absent.
+		if (pending_hk_start_selected_)
+			obs_data_array_release(pending_hk_start_selected_);
+		pending_hk_start_selected_ = obs_data_get_array(root, "hk_start_selected");
+		if (pending_hk_stop_selected_)
+			obs_data_array_release(pending_hk_stop_selected_);
+		pending_hk_stop_selected_ = obs_data_get_array(root, "hk_stop_selected");
+
 		slots_.clear();
 		size_t n = obs_data_array_count(arr);
 		// O-002: per-load-pass encoder introspection cache. slot_from_data

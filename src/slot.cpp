@@ -686,6 +686,16 @@ void SceneSlot::update_config(const Config &c)
 		start();
 }
 
+void SceneSlot::set_enabled(bool enabled)
+{
+	// Feature 019 (research D4): flip ONLY the flag under slot_mtx_ — the
+	// same lock start()'s Phase-1 gate reads it under, so the toggle is
+	// race-free against a concurrent start. Deliberately no hotkey
+	// re-registration or any other update_config side effect (FR-009).
+	std::lock_guard<std::mutex> lk(slot_mtx_);
+	cfg_.enabled = enabled;
+}
+
 // =============================================================================
 // start / stop
 // =============================================================================
@@ -707,6 +717,16 @@ bool SceneSlot::start()
 	uint64_t my_epoch;
 	{
 		std::lock_guard<std::mutex> pre_lk(slot_mtx_);
+		// Feature 019 (research D1): authoritative enabled gate. Every
+		// start path — bulk button, per-slot hotkey, state-column click,
+		// add_slot auto-start — funnels through here, so a disabled slot
+		// can never start and never acquires any encoder/output/shared-
+		// encoder resource (FR-004, FR-005).
+		if (!cfg_.enabled) {
+			blog(LOG_INFO, "[multi-scene-rec] '%s': start ignored — slot is disabled", cfg_.name.c_str());
+			running_.store(false);
+			return false;
+		}
 		if (cfg_.audio_tracks == 0) {
 			blog(LOG_WARNING, "[multi-scene-rec] '%s': no audio tracks selected; defaulting to track 1",
 			     cfg_.name.c_str());

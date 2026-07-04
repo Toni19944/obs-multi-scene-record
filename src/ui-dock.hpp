@@ -28,8 +28,8 @@ private slots:
 	void on_add();
 	void on_edit();
 	void on_remove();
-	void on_start_all();
-	void on_stop_all();
+	void on_start_selected();
+	void on_stop_selected();
 	void on_save_replay();
 	void on_cell_double_clicked(int row, int col);
 	void on_stats_toggled(bool on);
@@ -39,6 +39,12 @@ private:
 	// row `row`'s control starts it if stopped / stops it if running, then
 	// refreshes so the row shows the slot's true state.
 	void on_state_clicked(int row);
+
+	// Feature 019: COL_ENABLED checkbox toggle for row `row`. Unchecking a
+	// recording slot prompts, then stops cleanly before disabling (FR-014);
+	// every exit path ends in refresh() so the checkbox always re-syncs to
+	// the slot's true state (rapid-toggle convergence).
+	void on_enabled_toggled(int row, bool checked);
 
 	int current_row() const;
 	void apply_stats_visibility();
@@ -69,6 +75,9 @@ private:
 	struct RowRenderCache {
 		bool running = false;
 		bool replay_only = false;
+		// Feature 019: disabled rows can't run — the 1 Hz stats tick skips
+		// their styling work entirely (O-001 discipline).
+		bool enabled = true;
 		QString enc_display; // base encoder text (no fallback tag)
 		bool fallback = false;
 		bool dropped_warn = false; // orange dropped-frames foreground active

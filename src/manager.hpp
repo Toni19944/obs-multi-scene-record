@@ -94,8 +94,20 @@ public:
 	bool update_slot_by_id(const std::string &slot_id, const SceneSlot::Config &cfg);
 	bool remove_slot_by_id(const std::string &slot_id);
 
-	// Start / stop all
-	void start_all();
+	// Feature 019: id-based single-flag mutator for the dock's checkbox
+	// column. Resolves id -> slot under mtx_, releases mtx_, then calls
+	// SceneSlot::set_enabled (lock order mtx_ -> slot_mtx_, no new edges).
+	// Returns false — with zero mutation — when the id no longer resolves
+	// (same contract as update_slot_by_id).
+	bool set_slot_enabled_by_id(const std::string &id, bool enabled);
+
+	// Feature 019 (research D3): bulk actions for the dock buttons and the
+	// two global hotkeys — they act only on slots whose Config::enabled is
+	// set. stop_all() stays unfiltered for the internal lifecycle paths
+	// (shutdown / EXIT / collection / profile change) that must stop EVERY
+	// slot regardless of the flag (Constitution VII safety net).
+	void start_selected();
+	void stop_selected();
 	void stop_all();
 
 	std::string slot_name_by_id(const std::string &slot_id) const;
@@ -161,6 +173,13 @@ private:
 	static void frontend_event_cb(enum obs_frontend_event event, void *ptr);
 	static void save_cb(obs_data_t *save_data, bool saving, void *ptr);
 
+	// Feature 019 (research D5): global "Start/Stop selected" hotkey
+	// callbacks. Start runs synchronously on the hotkey thread (F-008
+	// precedent — start() is cheap under its locks); stop MUST defer to the
+	// UI task queue because stop() can block up to 5 s per output flush.
+	static void on_start_selected_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed);
+	static void on_stop_selected_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed);
+
 	mutable std::mutex mtx_;
 	std::vector<std::shared_ptr<SceneSlot>> slots_;
 	bool started_ = false;
@@ -176,4 +195,15 @@ private:
 	// global order mtx_ -> slot_mtx_ -> shared_mtx_.
 	std::map<std::string, std::unique_ptr<SharedEncoder>> shared_;
 	mutable std::mutex shared_mtx_;
+
+	// Feature 019: plugin-global "Start/Stop selected" hotkeys. Registered
+	// in register_all_hotkeys(), unregistered in unregister_all_hotkeys()
+	// (same FINISHED_LOADING / SCENE_COLLECTION_CHANGED cycle as the
+	// per-slot hotkeys). The pending arrays hold bindings read back from
+	// save data (ITEM A) until registration applies then releases them.
+	// Guarded by mtx_ like the register/unregister cycle itself.
+	obs_hotkey_id hk_start_selected_ = OBS_INVALID_HOTKEY_ID;
+	obs_hotkey_id hk_stop_selected_ = OBS_INVALID_HOTKEY_ID;
+	obs_data_array_t *pending_hk_start_selected_ = nullptr;
+	obs_data_array_t *pending_hk_stop_selected_ = nullptr;
 };

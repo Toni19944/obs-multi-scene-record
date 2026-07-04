@@ -22,6 +22,24 @@ following section headings as applicable:
 
 ## [0.7.0]
 
+### Added
+
+- Per-slot **Enabled** checkbox in the dock. Unchecking a slot excludes it
+  from bulk start/stop and immediately stops it if it is recording; the
+  enabled state is saved per slot and restored on load. Disabled rows are
+  dimmed so the active set is visible at a glance
+  (`019-selective-slot-control`).
+- Two global hotkeys, **Multi-Scene Record: Start selected** and
+  **Multi-Scene Record: Stop selected**, that act only on enabled slots
+  (`019-selective-slot-control`).
+
+### Changed
+
+- The dock's **Start all** / **Stop all** buttons are now **Start selected** /
+  **Stop selected** and operate only on enabled slots. With every slot enabled
+  (the default) the behaviour is unchanged from before
+  (`019-selective-slot-control`).
+
 ### Fixed
 
 - Fixed a use-after-free crash window where the 1 Hz statistics refresh or a

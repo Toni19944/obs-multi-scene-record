@@ -172,6 +172,12 @@ public:
 
 		// AV1 tile rows (any AV1 encoder). -1 = do not set. Key: "tile_rows".
 		int av1_tile_rows = -1;
+
+		// Feature 019: whether the slot participates in start actions. A
+		// disabled slot is refused by every start path (gate in start()).
+		// Default ON — new slots and pre-feature saves (absent key) load
+		// enabled, so untouched setups behave exactly as before.
+		bool enabled = true;
 	};
 
 	struct Stats {
@@ -200,6 +206,11 @@ public:
 
 	const Config &config() const { return cfg_; }
 	void update_config(const Config &c);
+
+	// Narrow mutator for Config::enabled (feature 019): takes slot_mtx_ and
+	// flips ONLY the flag — unlike update_config there is no hotkey
+	// re-registration cycle and no other side effect (FR-009).
+	void set_enabled(bool enabled);
 
 	// Hotkey lifecycle is owned by the caller (SlotManager), not by start/stop,
 	// so the "toggle recording" hotkey works even while the slot is stopped.
