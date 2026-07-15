@@ -7,7 +7,7 @@ An OBS Studio plugin that lets you record and clip from multiple scenes simultan
 ---
 ## Support:
 If you feel like supporting the development, you can do so via ko-fi:  
-https://ko-fi.com/tonisins
+https://ko-fi.com/tonisins -- if you put "github" in the message I know to use the money directly towards my Claude subscription lol. If not, then I'll just use it for... idk, coffee I guess since I don't drink beer anymore.
 
 ## Why this exists
 
@@ -80,4 +80,6 @@ See [BUILD.md](BUILD.md) for full instructions.
   - example with 3 slots:  
   - Without shared encoder: 3 encode passes per frame
   - With shared encoder (slots 2+3 depend on slot 1): 1 encode pass per frame, 3 file writers
-- Claude Code with Spec-Kit was used in the development of this plugin.
+
+
+## This plugin was mainly created using Claude Code + Spec-kit. I'm not a prosessional programmer by ANY metrics, I don't know shit about fuck. Plugin is provided as is, as per license, without any implied warranty. I wish I was in a state in life where I could confidently say that I know every line of code in here, but I'm not. I am working towards it tho. Contributions are always welcome, and greatly appreciated. 
