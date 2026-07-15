@@ -81,5 +81,5 @@ See [BUILD.md](BUILD.md) for full instructions.
   - Without shared encoder: 3 encode passes per frame
   - With shared encoder (slots 2+3 depend on slot 1): 1 encode pass per frame, 3 file writers
 
-
+---
 ## This plugin was mainly created using Claude Code + Spec-kit. I'm not a prosessional programmer by ANY metrics, I don't know shit about fuck. Plugin is provided as is, as per license, without any implied warranty. I wish I was in a state in life where I could confidently say that I know every line of code in here, but I'm not. I am working towards it tho. Contributions are always welcome, and greatly appreciated. 
